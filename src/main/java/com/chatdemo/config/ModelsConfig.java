@@ -28,4 +28,12 @@ public class ModelsConfig {
         new ProviderConfig("claude", "claude-sonnet-4-20250514", claudeKey),
         new ProviderConfig("grok", "grok-4", grokKey)
     );
+
+    public static String getOpenAiKey() {
+        return openaiKey;
+    }
+
+    public static String getGeminiKey() {
+        return geminiKey;
+    }
 }

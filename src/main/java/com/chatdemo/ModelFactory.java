@@ -1,9 +1,12 @@
 package com.chatdemo;
 
 import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.anthropic.AnthropicChatModel;
 import dev.langchain4j.model.googleai.GoogleAiGeminiChatModel;
+import dev.langchain4j.model.image.ImageModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
+import dev.langchain4j.model.openai.OpenAiImageModel;
 
 /**
  * Factory for creating LangChain4j ChatLanguageModel instances.
@@ -11,6 +14,8 @@ import dev.langchain4j.model.openai.OpenAiChatModel;
 public class ModelFactory {
     
     private static final String GROK_BASE_URL = "https://api.x.ai/v1";
+    private static final String OPENAI_IMAGE_MODEL = "dall-e-3";
+    private static final String GEMINI_IMAGE_MODEL = "gemini-2.5-flash-image";
     
     /**
      * Create a ChatLanguageModel based on the provider configuration.
@@ -23,6 +28,39 @@ public class ModelFactory {
             case "grok" -> createGrokModel(config);
             default -> throw new IllegalArgumentException("Unknown provider: " + config.providerType());
         };
+    }
+
+    /**
+     * Create a Gemini ChatModel for image generation outputs.
+     */
+    public static ChatModel createGeminiImageModel(String apiKey, String modelName) {
+        return GoogleAiGeminiChatModel.builder()
+            .apiKey(apiKey)
+            .modelName(modelName)
+            .build();
+    }
+
+    /**
+     * Create an ImageModel for OpenAI image generation.
+     */
+    public static ImageModel createImageModel(String apiKey) {
+        return createImageModel(apiKey, OPENAI_IMAGE_MODEL);
+    }
+
+    public static ImageModel createImageModel(String apiKey, String modelName) {
+        return OpenAiImageModel.builder()
+            .apiKey(apiKey)
+            .modelName(modelName)
+            .responseFormat("url")
+            .build();
+    }
+
+    public static String defaultOpenAiImageModel() {
+        return OPENAI_IMAGE_MODEL;
+    }
+
+    public static String defaultGeminiImageModel() {
+        return GEMINI_IMAGE_MODEL;
     }
     
     private static ChatLanguageModel createGeminiModel(ProviderConfig config) {
