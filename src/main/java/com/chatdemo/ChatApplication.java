@@ -7,12 +7,11 @@ import com.chatdemo.repository.ConversationRepository;
 import com.chatdemo.repository.InMemoryConversationRepository;
 import com.chatdemo.tools.ImageGenerationTool;
 import dev.langchain4j.memory.chat.ChatMemoryProvider;
-import dev.langchain4j.model.Tokenizer;
-import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.TokenCountEstimator;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.image.DisabledImageModel;
 import dev.langchain4j.model.image.ImageModel;
-import dev.langchain4j.model.openai.OpenAiTokenizer;
+import dev.langchain4j.model.openai.OpenAiTokenCountEstimator;
 import dev.langchain4j.service.AiServices;
 import dev.langchain4j.service.MemoryId;
 import dev.langchain4j.service.SystemMessage;
@@ -34,7 +33,7 @@ public class ChatApplication {
     private final List<ProviderConfig> configs;
     private final ConversationRepository conversationRepository;
     private final HistoryAwareChatMemoryStore memoryStore;
-    private final Tokenizer tokenizer;
+    private final TokenCountEstimator tokenCountEstimator;
     private final ImageGenerationTool imageTool;
     private final String defaultOpenAiImageModel;
     private final String defaultGeminiImageModel;
@@ -61,7 +60,7 @@ public class ChatApplication {
         this.configs = ModelsConfig.PROVIDERS;
         this.conversationRepository = new InMemoryConversationRepository();
         this.memoryStore = new HistoryAwareChatMemoryStore(conversationRepository);
-        this.tokenizer = new OpenAiTokenizer("gpt-4");
+        this.tokenCountEstimator = new OpenAiTokenCountEstimator("gpt-4");
         this.defaultOpenAiImageModel = ModelFactory.defaultOpenAiImageModel();
         this.defaultGeminiImageModel = ModelFactory.defaultGeminiImageModel();
         this.currentOpenAiImageModel = defaultOpenAiImageModel;
@@ -73,19 +72,19 @@ public class ChatApplication {
     }
     
     private Assistant createAssistant(ProviderConfig config) {
-        ChatLanguageModel model = ModelFactory.createModel(config);
+        ChatModel model = ModelFactory.createModel(config);
         refreshImageModels();
         
         ChatMemoryProvider memoryProvider = memoryId -> SummarizingTokenWindowChatMemory.builder()
             .id(memoryId)
             .maxTokens(MAX_TOKENS)
-            .tokenizer(tokenizer)
+            .tokenCountEstimator(tokenCountEstimator)
             .chatMemoryStore(memoryStore)
-            .chatLanguageModel(model)
+            .chatModel(model)
             .build();
         
         return AiServices.builder(Assistant.class)
-            .chatLanguageModel(model)
+            .chatModel(model)
             .chatMemoryProvider(memoryProvider)
             .tools(imageTool)
             .build();

@@ -1,6 +1,5 @@
 package com.chatdemo;
 
-import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.anthropic.AnthropicChatModel;
 import dev.langchain4j.model.googleai.GoogleAiGeminiChatModel;
@@ -9,7 +8,7 @@ import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.model.openai.OpenAiImageModel;
 
 /**
- * Factory for creating LangChain4j ChatLanguageModel instances.
+ * Factory for creating LangChain4j ChatModel instances.
  */
 public class ModelFactory {
     
@@ -18,9 +17,9 @@ public class ModelFactory {
     private static final String GEMINI_IMAGE_MODEL = "gemini-2.5-flash-image";
     
     /**
-     * Create a ChatLanguageModel based on the provider configuration.
+     * Create a ChatModel based on the provider configuration.
      */
-    public static ChatLanguageModel createModel(ProviderConfig config) {
+    public static ChatModel createModel(ProviderConfig config) {
         return switch (config.providerType().toLowerCase()) {
             case "gemini" -> createGeminiModel(config);
             case "chatgpt" -> createOpenAIModel(config);
@@ -63,28 +62,28 @@ public class ModelFactory {
         return GEMINI_IMAGE_MODEL;
     }
     
-    private static ChatLanguageModel createGeminiModel(ProviderConfig config) {
+    private static ChatModel createGeminiModel(ProviderConfig config) {
         return GoogleAiGeminiChatModel.builder()
             .apiKey(config.apiKey())
             .modelName(config.model())
             .build();
     }
     
-    private static ChatLanguageModel createOpenAIModel(ProviderConfig config) {
+    private static ChatModel createOpenAIModel(ProviderConfig config) {
         return OpenAiChatModel.builder()
             .apiKey(config.apiKey())
             .modelName(config.model())
             .build();
     }
     
-    private static ChatLanguageModel createClaudeModel(ProviderConfig config) {
+    private static ChatModel createClaudeModel(ProviderConfig config) {
         return AnthropicChatModel.builder()
             .apiKey(config.apiKey())
             .modelName(config.model())
             .build();
     }
     
-    private static ChatLanguageModel createGrokModel(ProviderConfig config) {
+    private static ChatModel createGrokModel(ProviderConfig config) {
         // Grok uses OpenAI-compatible API with custom base URL
         return OpenAiChatModel.builder()
             .apiKey(config.apiKey())

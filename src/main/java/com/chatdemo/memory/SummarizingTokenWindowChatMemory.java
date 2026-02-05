@@ -5,8 +5,8 @@ import dev.langchain4j.data.message.ChatMessage;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.memory.ChatMemory;
-import dev.langchain4j.model.Tokenizer;
-import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.TokenCountEstimator;
+import dev.langchain4j.model.chat.ChatModel;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -37,15 +37,15 @@ public class SummarizingTokenWindowChatMemory implements ChatMemory {
     
     private final Object id;
     private final int maxTokens;
-    private final Tokenizer tokenizer;
-    private final ChatLanguageModel summarizationModel;
+    private final TokenCountEstimator tokenCountEstimator;
+    private final ChatModel summarizationModel;
     private final HistoryAwareChatMemoryStore memoryStore;
     private final List<ChatMessage> messages;
     
     private SummarizingTokenWindowChatMemory(Builder builder) {
         this.id = builder.id;
         this.maxTokens = builder.maxTokens;
-        this.tokenizer = builder.tokenizer;
+        this.tokenCountEstimator = builder.tokenCountEstimator;
         this.summarizationModel = builder.summarizationModel;
         this.memoryStore = builder.memoryStore;
         this.messages = new ArrayList<>(memoryStore.getMessages(id));
@@ -200,7 +200,7 @@ public class SummarizingTokenWindowChatMemory implements ChatMemory {
         String prompt = String.format(SUMMARIZATION_PROMPT, conversationText);
         
         try {
-            return summarizationModel.generate(prompt);
+            return summarizationModel.chat(prompt);
         } catch (Exception e) {
             // Fallback: create a simple summary
             return existingSummary != null 
@@ -212,7 +212,7 @@ public class SummarizingTokenWindowChatMemory implements ChatMemory {
     private int countTokens(List<ChatMessage> msgs) {
         int total = 0;
         for (ChatMessage msg : msgs) {
-            total += tokenizer.estimateTokenCountInMessage(msg);
+            total += tokenCountEstimator.estimateTokenCountInMessage(msg);
         }
         return total;
     }
@@ -224,8 +224,8 @@ public class SummarizingTokenWindowChatMemory implements ChatMemory {
     public static class Builder {
         private Object id;
         private int maxTokens = 4000;
-        private Tokenizer tokenizer;
-        private ChatLanguageModel summarizationModel;
+        private TokenCountEstimator tokenCountEstimator;
+        private ChatModel summarizationModel;
         private HistoryAwareChatMemoryStore memoryStore;
         
         public Builder id(Object id) {
@@ -238,12 +238,12 @@ public class SummarizingTokenWindowChatMemory implements ChatMemory {
             return this;
         }
         
-        public Builder tokenizer(Tokenizer tokenizer) {
-            this.tokenizer = tokenizer;
+        public Builder tokenCountEstimator(TokenCountEstimator tokenCountEstimator) {
+            this.tokenCountEstimator = tokenCountEstimator;
             return this;
         }
         
-        public Builder chatLanguageModel(ChatLanguageModel model) {
+        public Builder chatModel(ChatModel model) {
             this.summarizationModel = model;
             return this;
         }
@@ -257,11 +257,11 @@ public class SummarizingTokenWindowChatMemory implements ChatMemory {
             if (id == null) {
                 throw new IllegalArgumentException("id must be set");
             }
-            if (tokenizer == null) {
-                throw new IllegalArgumentException("tokenizer must be set");
+            if (tokenCountEstimator == null) {
+                throw new IllegalArgumentException("tokenCountEstimator must be set");
             }
             if (summarizationModel == null) {
-                throw new IllegalArgumentException("chatLanguageModel must be set");
+                throw new IllegalArgumentException("chatModel must be set");
             }
             if (memoryStore == null) {
                 throw new IllegalArgumentException("chatMemoryStore must be set");
