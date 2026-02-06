@@ -36,4 +36,8 @@ public class ModelsConfig {
     public static String getGeminiKey() {
         return geminiKey;
     }
+
+    public static String getGrokKey() {
+        return grokKey;
+    }
 }

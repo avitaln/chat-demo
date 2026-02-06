@@ -48,6 +48,13 @@
             <version>${langchain4j.version}</version>
         </dependency>
 
+        <!-- Firebase Admin SDK for Storage uploads -->
+        <dependency>
+            <groupId>com.google.firebase</groupId>
+            <artifactId>firebase-admin</artifactId>
+            <version>9.7.1</version>
+        </dependency>
+
         <!-- Jackson for JSON persistence -->
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
