@@ -132,7 +132,12 @@ class ChatRoutes(private val backend: ChatBackend) {
               return
             }
             val requestAttachments = deserializeAttachments(body.get("attachments").asInstanceOf[java.util.List[_]])
-            val modelIndex = parseModelIndex(body.get("modelIndex"))
+            val modelId = valueAsString(body.get("modelId"))
+            if (modelId == null || modelId.isBlank) {
+              sendJson(ex, StatusCodes.BAD_REQUEST, JMap.of("error", "modelId is required"))
+              return
+            }
+            val agentId = Option(valueAsString(body.get("agentId"))).filter(_.nonEmpty)
             val userContext = parseUserContext(body)
 
             // SSE headers
@@ -143,17 +148,23 @@ class ChatRoutes(private val backend: ChatBackend) {
             ex.startBlocking()
             val out: OutputStream = ex.getOutputStream
 
-            val result = backend.chat(id, message, requestAttachments, modelIndex, userContext, new ChatStreamHandler {
-              override def onToken(token: String): Unit = {
-                try {
-                  val sseData = "data: " + mapper.writeValueAsString(JMap.of("token", token)) + "\n\n"
-                  out.write(sseData.getBytes(StandardCharsets.UTF_8))
-                  out.flush()
-                } catch {
-                  case _: Exception => // client disconnected
+            val result = try {
+              backend.chat(id, message, requestAttachments, modelId, agentId, userContext, new ChatStreamHandler {
+                override def onToken(token: String): Unit = {
+                  try {
+                    val sseData = "data: " + mapper.writeValueAsString(JMap.of("token", token)) + "\n\n"
+                    out.write(sseData.getBytes(StandardCharsets.UTF_8))
+                    out.flush()
+                  } catch {
+                    case _: Exception => // client disconnected
+                  }
                 }
-              }
-            })
+              })
+            } catch {
+              case iae: IllegalArgumentException =>
+                sendJson(ex, StatusCodes.BAD_REQUEST, JMap.of("error", iae.getMessage))
+                return
+            }
 
             // Send final event with result
             val done = new JHashMap[String, AnyRef]()
@@ -184,7 +195,7 @@ class ChatRoutes(private val backend: ChatBackend) {
   private def getModels(exchange: HttpServerExchange): Unit = {
     val models = backend.getAvailableModels
     val modelList: java.util.List[JMap[String, String]] = models.map { m =>
-      JMap.of("providerType", m.providerType, "model", m.model, "displayName", m.getDisplayName)
+      JMap.of("id", m.modelId, "providerType", m.providerType, "model", m.model, "displayName", m.getDisplayName)
     }.asJava
     val result = new JHashMap[String, AnyRef]()
     result.put("models", modelList)
@@ -220,16 +231,6 @@ class ChatRoutes(private val backend: ChatBackend) {
   private def queryParam(exchange: HttpServerExchange, name: String): String = {
     val qp = exchange.getQueryParameters.get(name)
     if (qp != null) qp.getFirst else null
-  }
-
-  private def parseModelIndex(value: AnyRef): Int = {
-    if (value == null) return 0
-    value match {
-      case n: Number => n.intValue()
-      case s: String =>
-        try { s.toInt } catch { case _: NumberFormatException => 0 }
-      case _ => 0
-    }
   }
 
   private def parseBoolean(value: AnyRef): Boolean = {

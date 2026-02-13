@@ -170,9 +170,10 @@ class HttpChatBackend(baseUrl: String) extends ChatBackend with ImageModelAccess
       for (obj <- models.asScala) {
         val m = obj.asInstanceOf[java.util.Map[_, _]]
         result.append(ProviderConfig(
-          m.get("providerType").asInstanceOf[String],
-          m.get("model").asInstanceOf[String],
-          "" // API key not exposed over HTTP
+          providerType = m.get("providerType").asInstanceOf[String],
+          model = m.get("model").asInstanceOf[String],
+          apiKey = "", // API key not exposed over HTTP
+          id = m.get("id").asInstanceOf[String]
         ))
       }
       result.toList
@@ -190,14 +191,16 @@ class HttpChatBackend(baseUrl: String) extends ChatBackend with ImageModelAccess
     conversationId: String,
     message: String,
     attachments: List[MessageAttachment],
-    modelIndex: Int,
+    modelId: String,
+    agentId: Option[String],
     userContext: UserContext,
     streamHandler: ChatStreamHandler
   ): ChatResult = {
     try {
       val requestBody = new java.util.LinkedHashMap[String, AnyRef]()
       requestBody.put("message", message)
-      requestBody.put("modelIndex", Int.box(modelIndex))
+      requestBody.put("modelId", modelId)
+      agentId.foreach(id => requestBody.put("agentId", id))
       requestBody.put("isPremium", userContext.isPremium)
       requestBody.put("deviceId", userContext.deviceId)
       userContext.signedInId.foreach(id => requestBody.put("signedInId", id))

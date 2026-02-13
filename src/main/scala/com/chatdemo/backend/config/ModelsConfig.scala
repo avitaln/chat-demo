@@ -26,6 +26,7 @@ object ModelsConfig {
 
   def getOpenAiKey: String = openaiKey
   def getGeminiKey: String = geminiKey
+  def getClaudeKey: String = claudeKey
   def getGrokKey: String = grokKey
   def getAliBabaKey: String = aliBabaKey
 }

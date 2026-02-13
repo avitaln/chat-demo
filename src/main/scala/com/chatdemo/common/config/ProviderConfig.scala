@@ -7,7 +7,12 @@ package com.chatdemo.common.config
  * @param model        The model identifier to use
  * @param apiKey       The API key for authentication
  */
-case class ProviderConfig(providerType: String, model: String, apiKey: String) {
+case class ProviderConfig(providerType: String, model: String, apiKey: String, id: String = "") {
+
+  /** Stable model ID for API and request routing. */
+  def modelId: String = {
+    if (id != null && !id.isBlank) id else s"${providerType.toLowerCase}:${model}"
+  }
 
   /** Formatted display name like "ChatGPT (gpt-4o)". */
   def getDisplayName: String = {

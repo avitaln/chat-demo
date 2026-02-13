@@ -24,7 +24,7 @@ class ChatApplication(private val backend: ChatBackend) {
   private val PremiumAppleUserContext = UserContext(isPremium = "true", deviceId = "device-premium-001", signedInId = Some("apple-user-001"))
 
   private var currentConversationId: String = _
-  private var currentModelIndex: Int = 0
+  private var currentModelId: String = _
   private var currentUserContext: UserContext = FreeUserContext
   private val pendingAttachments: ArrayBuffer[MessageAttachment] = ArrayBuffer.empty
 
@@ -81,7 +81,10 @@ class ChatApplication(private val backend: ChatBackend) {
     println()
     val models = backend.getAvailableModels
     if (models.nonEmpty) {
-      println("Current model: " + models(currentModelIndex).getDisplayName)
+      if (currentModelId == null || !models.exists(_.modelId == currentModelId)) {
+        currentModelId = models.head.modelId
+      }
+      println("Current model: " + models.find(_.modelId == currentModelId).map(_.getDisplayName).getOrElse(models.head.getDisplayName))
     }
     println()
     println("Use /c <id> to create or load a conversation, or /c to list all conversations.")
@@ -186,7 +189,7 @@ class ChatApplication(private val backend: ChatBackend) {
 
     println("\nAvailable models:")
     for (i <- models.indices) {
-      val marker = if (i == currentModelIndex) " [current]" else ""
+      val marker = if (models(i).modelId == currentModelId) " [current]" else ""
       println(s"  ${i + 1}. ${models(i).getDisplayName}$marker")
     }
 
@@ -196,7 +199,7 @@ class ChatApplication(private val backend: ChatBackend) {
     try {
       val index = Integer.parseInt(choice) - 1
       if (index >= 0 && index < models.size) {
-        currentModelIndex = index
+        currentModelId = models(index).modelId
         println("Switched to: " + models(index).getDisplayName)
         println("(Will be used on next chat request)")
       } else {
@@ -224,8 +227,11 @@ class ChatApplication(private val backend: ChatBackend) {
     }
 
     val models = backend.getAvailableModels
-    val providerName = if (models.nonEmpty && currentModelIndex < models.size) {
-      models(currentModelIndex).getDisplayName.split(" ")(0)
+    if (models.nonEmpty && (currentModelId == null || !models.exists(_.modelId == currentModelId))) {
+      currentModelId = models.head.modelId
+    }
+    val providerName = if (models.nonEmpty) {
+      models.find(_.modelId == currentModelId).map(_.getDisplayName.split(" ")(0)).getOrElse("AI")
     } else {
       "AI"
     }
@@ -236,7 +242,12 @@ class ChatApplication(private val backend: ChatBackend) {
     val attachments = pendingAttachments.toList
     pendingAttachments.clear()
 
-    val result = backend.chat(currentConversationId, message, attachments, currentModelIndex, currentUserContext,
+    val resolvedModelId = if (currentModelId == null || currentModelId.isBlank) {
+      models.headOption.map(_.modelId).getOrElse("")
+    } else {
+      currentModelId
+    }
+    val result = backend.chat(currentConversationId, message, attachments, resolvedModelId, None, currentUserContext,
       new com.chatdemo.common.service.ChatStreamHandler {
         override def onToken(token: String): Unit = {
           print(token)

@@ -39,7 +39,8 @@ trait ChatBackend {
    * @param conversationId conversation to chat in
    * @param message        the user's message text
    * @param attachments    attachments for this turn (images as links, documents, etc.)
-   * @param modelIndex     index into getAvailableModels for the model to use
+   * @param modelId        id into getAvailableModels for the model to use
+   * @param agentId        optional agent id that maps to a system prompt
    * @param userContext    user context containing premium status and identity
    * @param streamHandler  callback that receives streaming tokens
    */
@@ -47,7 +48,8 @@ trait ChatBackend {
     conversationId: String,
     message: String,
     attachments: List[MessageAttachment],
-    modelIndex: Int,
+    modelId: String,
+    agentId: Option[String],
     userContext: UserContext,
     streamHandler: ChatStreamHandler
   ): ChatResult

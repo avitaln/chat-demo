@@ -5,6 +5,7 @@ import com.chatdemo.backend.document.{DocumentArtifactCache, DocumentContextServ
 import com.chatdemo.backend.logging.LlmExchangeLogger
 import com.chatdemo.backend.memory.{HistoryAwareChatMemoryStore, SummarizingTokenWindowChatMemory}
 import com.chatdemo.backend.model.ModelFactory
+import com.chatdemo.backend.provider.{AgentsProvider, HardcodedAgentsProvider, HardcodedModelsProvider, ModelsProvider}
 import com.chatdemo.backend.repository.{ConversationRepository, FirestoreConversationRepository}
 import com.chatdemo.backend.storage.FirebaseStorageUploader
 import com.chatdemo.backend.tools.{GeminiImageGenerationTool, GrokImageGenerationTool, ImageGenerationTool, OpenAiImageGenerationTool, QwenImageGenerationTool}
@@ -44,7 +45,10 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
   private val UrlPattern: Pattern = Pattern.compile("(https?://\\S+)")
 
   // --- Immutable / shared infrastructure (safe across requests) ---
-  private val configs: List[ProviderConfig] = ModelsConfig.Providers
+  private val modelsProvider: ModelsProvider = new HardcodedModelsProvider()
+  private val agentsProvider: AgentsProvider = new HardcodedAgentsProvider()
+  private val configs: List[ProviderConfig] = modelsProvider.getAvailableModels
+  private val agentsById: Map[String, String] = agentsProvider.getAvailableAgents.map(agent => agent.id -> agent.systemPrompt).toMap
   private val firebaseInitializer: FirebaseInitializer = new FirebaseInitializer(
     FirebaseConfig.getServiceAccountPath,
     FirebaseConfig.getStorageBucket
@@ -128,7 +132,8 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     conversationId: String,
     message: String,
     attachments: List[MessageAttachment],
-    modelIndex: Int,
+    modelId: String,
+    agentId: Option[String],
     userContext: UserContext,
     streamHandler: ChatStreamHandler
   ): ChatResult = {
@@ -140,8 +145,9 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     }
     val isPremium = userContext.isPremium.toBoolean
 
-    val safeModelIndex = if (modelIndex >= 0 && modelIndex < configs.size) modelIndex else 0
-    val currentConfig = configs(safeModelIndex)
+    val currentConfig = resolveModelConfig(modelId).getOrElse {
+      throw new IllegalArgumentException("unknown modelId: " + modelId)
+    }
     val providerName = currentConfig.getDisplayName.split(" ")(0)
     val modelName = currentConfig.model
     val promptImageIntent = traceStep("classifyPromptImageIntent") {
@@ -149,7 +155,7 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     }
 
     val systemPrompt = traceStep("buildSystemPrompt") {
-      getSystemPromptForRequest(conversationId, message)
+      getSystemPromptForRequest(agentId)
     }
     lazy val requestHistory = traceStep("loadHistoryForEnrichment") {
       conversationRepository.getFullHistory(userContext, conversationId)
@@ -162,7 +168,7 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     }
 
     if (shouldUseDirectVisionAnswer(currentConfig, message, attachments)) {
-      tryDirectVisionAnswer(userContext, conversationId, message, attachments, safeModelIndex, streamHandler, providerName, modelName) match {
+      tryDirectVisionAnswer(userContext, conversationId, message, attachments, currentConfig, streamHandler, providerName, modelName) match {
         case Some(result) =>
           llmExchangeLogger.logExchange(
             providerName, modelName, message, "[multimodal] " + message,
@@ -612,13 +618,15 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     payload.toList
   }
 
-  private def getSystemPromptForRequest(memoryId: String, userMessage: String): String =
-    "You are a helpful assistant. Respond clearly and concisely. " +
-      "If the user asks to create, draw, generate, edit, or modify images, you MUST call the generate_image tool. " +
-      "IMPORTANT: Do NOT attempt to generate or create images yourself. You MUST use the generate_image tool for ALL image requests. " +
-      "When the user wants to modify a previously generated image, call generate_image with a complete prompt that describes the full desired result including the requested changes. " +
-      "For normal knowledge and reasoning questions, answer directly without image tools. " +
-      "Return tool outputs directly when they satisfy the request."
+  private def getSystemPromptForRequest(agentId: Option[String]): String = {
+    agentId match {
+      case Some(id) =>
+        agentsById.get(id).getOrElse {
+          throw new IllegalArgumentException("unknown agentId: " + id)
+        }
+      case None => defaultSystemPrompt
+    }
+  }
 
   private def formatPayloadMessage(message: ChatMessage): String = {
     message match {
@@ -661,7 +669,7 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     conversationId: String,
     message: String,
     attachments: List[MessageAttachment],
-    modelIndex: Int,
+    modelConfig: ProviderConfig,
     streamHandler: ChatStreamHandler,
     providerName: String,
     modelName: String
@@ -678,7 +686,7 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
         ImageContent.from(base64, payload.mimeType),
         TextContent.from(prompt)
       )
-      val response: ChatResponse = ModelFactory.createModel(configs(modelIndex)).chat(userMessage)
+      val response: ChatResponse = ModelFactory.createModel(modelConfig).chat(userMessage)
       val aiText = Option(response.aiMessage()).map(_.text()).getOrElse("")
 
       conversationRepository.addMessage(userContext, conversationId, UserMessage.from(message))
@@ -927,5 +935,18 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
       val elapsedMs = (System.nanoTime() - startedAt) / 1000000L
       println(s"[perf] $label conversationId=$conversationId user=${userContext.effectiveId} took ${elapsedMs}ms")
     }
+  }
+
+  private val defaultSystemPrompt: String =
+    "You are a helpful assistant. Respond clearly and concisely. " +
+      "If the user asks to create, draw, generate, edit, or modify images, you MUST call the generate_image tool. " +
+      "IMPORTANT: Do NOT attempt to generate or create images yourself. You MUST use the generate_image tool for ALL image requests. " +
+      "When the user wants to modify a previously generated image, call generate_image with a complete prompt that describes the full desired result including the requested changes. " +
+      "For normal knowledge and reasoning questions, answer directly without image tools. " +
+      "Return tool outputs directly when they satisfy the request."
+
+  private def resolveModelConfig(modelId: String): Option[ProviderConfig] = {
+    if (modelId == null || modelId.isBlank) None
+    else configs.find(_.modelId == modelId)
   }
 }
