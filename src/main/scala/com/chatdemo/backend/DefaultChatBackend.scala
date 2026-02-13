@@ -87,6 +87,38 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
   }
 
   /**
+   * Wraps a ChatStreamHandler to buffer onToken calls.
+   * Used for image-intent requests so that a model refusal can be discarded
+   * if the fallback image tool succeeds.
+   */
+  private class BufferingChatStreamHandler(delegate: ChatStreamHandler) extends ChatStreamHandler {
+    private val buffer = new StringBuilder()
+    @volatile private var passthrough = false
+
+    /** Flush buffered tokens to the delegate and switch to passthrough mode. */
+    def flushAndPassthrough(): Unit = synchronized {
+      if (!passthrough) {
+        passthrough = true
+        if (buffer.nonEmpty) delegate.onToken(buffer.toString())
+        buffer.clear()
+      }
+    }
+
+    /** Discard buffered tokens and switch to passthrough mode. */
+    def discardBuffer(): Unit = synchronized {
+      buffer.clear()
+      passthrough = true
+    }
+
+    override def onToken(token: String): Unit = synchronized {
+      if (passthrough) delegate.onToken(token)
+      else buffer.append(token)
+    }
+
+    override def onImageGenerationStarted(): Unit = delegate.onImageGenerationStarted()
+  }
+
+  /**
    * AI Assistant trait - LangChain4j will implement this via proxy.
    */
   trait Assistant {
@@ -180,10 +212,19 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
       }
     }
 
+    val isImageIntent = promptImageIntent == PromptImageIntent.GENERATE_NEW ||
+                        promptImageIntent == PromptImageIntent.EDIT_EXISTING
+    val bufferingHandler: Option[BufferingChatStreamHandler] =
+      if (isImageIntent) Some(new BufferingChatStreamHandler(streamHandler)) else None
+    val effectiveStreamHandler: ChatStreamHandler = bufferingHandler.getOrElse(streamHandler)
+
     val imageToolSession = createImageToolSession(
       isPremium = isPremium,
       config = currentConfig,
-      onImageGenerationStarted = () => streamHandler.onToken("generating your image...")
+      onImageGenerationStarted = () => {
+        bufferingHandler.foreach(_.flushAndPassthrough())
+        streamHandler.onImageGenerationStarted()
+      }
     )
     val assistant = createAssistant(currentConfig, imageToolSession, userContext)
 
@@ -197,7 +238,7 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
       }
       stream.onPartialResponse(token => {
         responseBuffer.append(token)
-        streamHandler.onToken(token)
+        effectiveStreamHandler.onToken(token)
       }).onCompleteResponse(_ => {
         done.countDown()
       }).onError(error => {
@@ -224,11 +265,12 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
         }
       val initialResponseText = responseBuffer.toString()
       if (shouldAttemptDirectImageToolFallback(message, initialResponseText, latestAttachments, errorHolder(0), imageToolSession, promptImageIntent)) {
+        bufferingHandler.foreach(_.discardBuffer())
         val fallbackText = runDirectImageToolFallback(userContext, conversationId, message, messageForModel, attachments, imageToolSession, promptImageIntent)
         if (fallbackText != null && !fallbackText.isBlank) {
-          val separator = if (responseBuffer.isEmpty) "" else "\n"
-          streamHandler.onToken(separator + fallbackText)
-          responseBuffer.append(separator).append(fallbackText)
+          streamHandler.onToken(fallbackText)
+          responseBuffer.clear()
+          responseBuffer.append(fallbackText)
           val fallbackAttachments = consumeToolAttachments(userContext, conversationId, imageToolSession)
           if (fallbackAttachments.nonEmpty) {
             latestAttachments = fallbackAttachments

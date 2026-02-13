@@ -232,6 +232,10 @@ class HttpChatBackend(baseUrl: String) extends ChatBackend with ImageModelAccess
                 streamHandler.onToken(event.get("token").asInstanceOf[String])
               }
 
+              if (java.lang.Boolean.TRUE == event.get("imageGenerating")) {
+                streamHandler.onImageGenerationStarted()
+              }
+
               if (java.lang.Boolean.TRUE == event.get("done")) {
                 if (event.containsKey("error")) {
                   error = event.get("error").asInstanceOf[String]

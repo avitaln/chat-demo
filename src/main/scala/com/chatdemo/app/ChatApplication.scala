@@ -253,6 +253,10 @@ class ChatApplication(private val backend: ChatBackend) {
           print(token)
           System.out.flush()
         }
+        override def onImageGenerationStarted(): Unit = {
+          println("\n[Generating image...]")
+          System.out.flush()
+        }
       })
 
     println()

@@ -159,6 +159,15 @@ class ChatRoutes(private val backend: ChatBackend) {
                     case _: Exception => // client disconnected
                   }
                 }
+                override def onImageGenerationStarted(): Unit = {
+                  try {
+                    val sseData = "data: " + mapper.writeValueAsString(JMap.of("imageGenerating", java.lang.Boolean.TRUE)) + "\n\n"
+                    out.write(sseData.getBytes(StandardCharsets.UTF_8))
+                    out.flush()
+                  } catch {
+                    case _: Exception => // client disconnected
+                  }
+                }
               })
             } catch {
               case iae: IllegalArgumentException =>

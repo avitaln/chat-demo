@@ -5,4 +5,5 @@ package com.chatdemo.common.service
  */
 trait ChatStreamHandler {
   def onToken(token: String): Unit
+  def onImageGenerationStarted(): Unit = {}
 }
