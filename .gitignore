@@ -2,3 +2,5 @@ target/
 r.sh
 run.sh
 firebase_settings.json
+logs/
+chat-demo.db
