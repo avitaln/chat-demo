@@ -2,7 +2,7 @@ package com.chatdemo.backend.server
 
 import com.chatdemo.common.config.ProviderConfig
 import com.chatdemo.common.model.{ConversationMessage, MessageAttachment}
-import com.chatdemo.common.service.{ChatBackend, ChatResult, ChatStreamHandler, ImageModelStatus}
+import com.chatdemo.common.service.{ChatBackend, ChatResult, ChatStreamHandler}
 import com.fasterxml.jackson.databind.ObjectMapper
 import io.undertow.server.{HttpHandler, HttpServerExchange, RoutingHandler}
 import io.undertow.util.{Headers, PathTemplateMatch, StatusCodes}

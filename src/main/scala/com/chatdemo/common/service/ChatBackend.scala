@@ -50,10 +50,4 @@ trait ChatBackend {
   ): ChatResult
 
   def clearConversation(conversationId: String): Unit
-
-  // ---- Image model ----
-
-  def getImageModelStatus: ImageModelStatus
-
-  def setImageModel(provider: String, modelName: String): ImageModelStatus
 }

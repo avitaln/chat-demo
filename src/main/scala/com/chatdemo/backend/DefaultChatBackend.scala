@@ -7,10 +7,10 @@ import com.chatdemo.backend.memory.{HistoryAwareChatMemoryStore, SummarizingToke
 import com.chatdemo.backend.model.ModelFactory
 import com.chatdemo.backend.repository.{ConversationRepository, SqliteConversationRepository}
 import com.chatdemo.backend.storage.FirebaseStorageUploader
-import com.chatdemo.backend.tools.ImageGenerationTool
+import com.chatdemo.backend.tools.{GeminiImageGenerationTool, GrokImageGenerationTool, ImageGenerationTool, OpenAiImageGenerationTool, QwenImageGenerationTool}
 import com.chatdemo.common.config.ProviderConfig
 import com.chatdemo.common.model.{ConversationMessage, MessageAttachment, MessageAttachmentExtractor}
-import com.chatdemo.common.service.{ChatBackend, ChatResult, ChatStreamHandler, ImageModelStatus}
+import com.chatdemo.common.service.{ChatBackend, ChatResult, ChatStreamHandler, ExposedImageModel, ImageModelAccessPolicy}
 import dev.langchain4j.data.message.{AiMessage, ChatMessage, ImageContent, TextContent, UserMessage}
 import dev.langchain4j.memory.chat.ChatMemoryProvider
 import dev.langchain4j.model.TokenCountEstimator
@@ -38,11 +38,9 @@ import scala.jdk.CollectionConverters.*
  * inline. No cross-request in-memory state is held for chat context.
  * Conversation history is loaded from the repository per request.
  */
-class DefaultChatBackend extends ChatBackend {
+class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
 
   private val MaxTokens = 4000
-  private val NonPremiumImageDeniedMessage =
-    "System: Image generation and image editing are available for premium users only."
   private val UrlPattern: Pattern = Pattern.compile("(https?://\\S+)")
 
   // --- Immutable / shared infrastructure (safe across requests) ---
@@ -52,21 +50,34 @@ class DefaultChatBackend extends ChatBackend {
   )
   private val memoryStore = new HistoryAwareChatMemoryStore(conversationRepository)
   private val tokenCountEstimator: TokenCountEstimator = new OpenAiTokenCountEstimator("gpt-4")
-  private val imageTool = new ImageGenerationTool()
   private val documentContextService: DocumentContextService = createDocumentContextService()
   private val llmExchangeLogger = new LlmExchangeLogger(Path.of("logs", "llm-exchanges.log"))
 
-  // --- Image model defaults (kept for image generation tool config) ---
-  private val defaultOpenAiImageModel: String = ModelFactory.defaultOpenAiImageModel
+  // --- Image model policy defaults ---
   private val defaultGeminiImageModel: String = ModelFactory.defaultGeminiImageModel
+  private val defaultOpenAiImageModel: String = ModelFactory.defaultOpenAiImageModel
   private val defaultGrokImageModel: String = ModelFactory.defaultGrokImageModel
-  private var currentOpenAiImageModel: String = defaultOpenAiImageModel
-  private var currentGeminiImageModel: String = defaultGeminiImageModel
-  private var currentGrokImageModel: String = defaultGrokImageModel
-  private var currentImageProvider: String = "openai"
+  private val defaultQwenCreateImageModel: String = ModelFactory.defaultQwenCreateImageModel
+  private val defaultQwenEditImageModel: String = ModelFactory.defaultQwenEditImageModel
 
-  configureFirebaseStorage()
-  refreshImageModels()
+  override def premiumImageModel: ExposedImageModel = ExposedImageModel("gemini", defaultGeminiImageModel)
+
+  override def freeImageModel: ExposedImageModel = ExposedImageModel("qwen", defaultQwenCreateImageModel)
+
+  private val firebaseStorageUploader: FirebaseStorageUploader = createFirebaseStorageUploader()
+  private val imageToolDependencies: ImageToolDependencies = loadImageToolDependencies()
+  private val imageIntentClassifierPrompt: String =
+    "Classify the user's intent for image operation from the message text only.\n" +
+      "Return exactly one label: GENERATE_NEW, EDIT_EXISTING, or NONE.\n" +
+      "Rules:\n" +
+      "- GENERATE_NEW: user wants a new image to be created.\n" +
+      "- EDIT_EXISTING: user wants to modify a previously shared image.\n" +
+      "- NONE: user is not asking for image creation/editing.\n" +
+      "Do not add any extra words."
+
+  private enum PromptImageIntent {
+    case GENERATE_NEW, EDIT_EXISTING, NONE, UNKNOWN
+  }
 
   /**
    * AI Assistant trait - LangChain4j will implement this via proxy.
@@ -120,19 +131,10 @@ class DefaultChatBackend extends ChatBackend {
     val currentConfig = configs(safeModelIndex)
     val providerName = currentConfig.getDisplayName.split(" ")(0)
     val modelName = currentConfig.model
-
-    if (shouldRejectImageRequestForNonPremium(isPremium, conversationId, message, attachments)) {
-      val denied = denyNonPremiumImageRequest(conversationId, message, attachments, streamHandler)
-      llmExchangeLogger.logExchange(
-        providerName, modelName, message, message,
-        List("[system] " + NonPremiumImageDeniedMessage, "[user] " + safeMessage(message)),
-        NonPremiumImageDeniedMessage, Nil, null
-      )
-      return denied
-    }
+    val promptImageIntent = classifyPromptImageIntent(currentConfig, message)
 
     val systemPrompt = getSystemPromptForRequest(conversationId, message)
-    val messageForModel = enrichMessageForModel(conversationId, message, attachments)
+    val messageForModel = enrichMessageForModel(conversationId, message, attachments, promptImageIntent)
     val effectivePayload = buildEffectivePayload(conversationId, systemPrompt, messageForModel)
 
     if (shouldUseDirectVisionAnswer(currentConfig, message, attachments)) {
@@ -148,9 +150,8 @@ class DefaultChatBackend extends ChatBackend {
       }
     }
 
-    // Build assistant per-request (no cached state) — always register image tools;
-    // the LLM and system prompt decide when to use them.
-    val assistant = createAssistant(currentConfig, includeImageTools = true)
+    val imageToolSession = createImageToolSession(isPremium, currentConfig)
+    val assistant = createAssistant(currentConfig, imageToolSession)
 
     val done = new CountDownLatch(1)
     val responseBuffer = new StringBuilder()
@@ -173,10 +174,23 @@ class DefaultChatBackend extends ChatBackend {
       if (attachments.nonEmpty) {
         conversationRepository.attachToLatestUserMessage(conversationId, attachments)
       }
-      val toolAttachments = consumeToolAttachments(conversationId)
-      val latestAttachments =
+      val toolAttachments = consumeToolAttachments(conversationId, imageToolSession)
+      var latestAttachments =
         if (toolAttachments.nonEmpty) toolAttachments
         else getLatestAiAttachments(conversationId)
+      val initialResponseText = responseBuffer.toString()
+      if (shouldAttemptDirectImageToolFallback(message, initialResponseText, latestAttachments, errorHolder(0), imageToolSession, promptImageIntent)) {
+        val fallbackText = runDirectImageToolFallback(conversationId, message, messageForModel, attachments, imageToolSession, promptImageIntent)
+        if (fallbackText != null && !fallbackText.isBlank) {
+          val separator = if (responseBuffer.isEmpty) "" else "\n"
+          streamHandler.onToken(separator + fallbackText)
+          responseBuffer.append(separator).append(fallbackText)
+          val fallbackAttachments = consumeToolAttachments(conversationId, imageToolSession)
+          if (fallbackAttachments.nonEmpty) {
+            latestAttachments = fallbackAttachments
+          }
+        }
+      }
       llmExchangeLogger.logExchange(
         providerName, modelName, message, messageForModel,
         effectivePayload, responseBuffer.toString(),
@@ -208,62 +222,15 @@ class DefaultChatBackend extends ChatBackend {
     conversationRepository.clear(conversationId)
   }
 
-  // ----------------------------------------------------------------
-  // Image model
-  // ----------------------------------------------------------------
-
-  override def getImageModelStatus: ImageModelStatus = {
-    ImageModelStatus(
-      currentImageProvider,
-      imageTool.getCurrentModelName,
-      currentOpenAiImageModel,
-      currentGeminiImageModel,
-      currentGrokImageModel,
-      defaultGeminiImageModel
-    )
-  }
-
-  override def setImageModel(provider: String, modelName: String): ImageModelStatus = {
-    provider match {
-      case "openai" =>
-        if (modelName != null && !modelName.isBlank) {
-          currentOpenAiImageModel = modelName
-        }
-        currentImageProvider = "openai"
-        imageTool.setProvider(ImageGenerationTool.Provider.OPENAI)
-      case "gemini" =>
-        if (modelName != null && !modelName.isBlank) {
-          currentGeminiImageModel = modelName
-        }
-        currentImageProvider = "gemini"
-        imageTool.setProvider(ImageGenerationTool.Provider.GEMINI)
-      case "grok" =>
-        if (modelName != null && !modelName.isBlank) {
-          currentGrokImageModel = modelName
-        }
-        currentImageProvider = "grok"
-        imageTool.setProvider(ImageGenerationTool.Provider.GROK)
-      case _ => // ignore unknown
-    }
-    refreshImageModels()
-    getImageModelStatus
-  }
-
   def getLogPath: String = llmExchangeLogger.getLogPath.toAbsolutePath.toString
 
   // ----------------------------------------------------------------
   // Internal wiring (per-request assistant creation)
   // ----------------------------------------------------------------
 
-  private def createAssistant(config: ProviderConfig, includeImageTools: Boolean): Assistant = {
+  private def createAssistant(config: ProviderConfig, imageToolSession: ImageToolSession): Assistant = {
     val model: ChatModel = ModelFactory.createModel(config)
     val streamingModel: StreamingChatModel = ModelFactory.createStreamingModel(config)
-    syncImageProviderWithChatModel(config)
-    if ("claude".equalsIgnoreCase(config.providerType)) {
-      imageTool.disableImageTools("Image generation is not available when using Anthropic.")
-    } else {
-      imageTool.enableImageTools()
-    }
 
     val memoryProvider: ChatMemoryProvider = (memoryId: AnyRef) => {
       SummarizingTokenWindowChatMemory.builder()
@@ -278,62 +245,111 @@ class DefaultChatBackend extends ChatBackend {
     val builder = AiServices.builder(classOf[Assistant])
       .streamingChatModel(streamingModel)
       .chatMemoryProvider(memoryProvider)
-    if (includeImageTools) {
-      builder.tools(imageTool)
-    }
+    imageToolSession.tool.foreach(tool => builder.tools(tool))
     builder.build()
   }
 
-  private def syncImageProviderWithChatModel(config: ProviderConfig): Unit = {
-    config.providerType.toLowerCase match {
-      case "gemini" =>
-        currentImageProvider = "gemini"
-        imageTool.setProvider(ImageGenerationTool.Provider.GEMINI)
-      case "chatgpt" =>
-        currentImageProvider = "openai"
-        imageTool.setProvider(ImageGenerationTool.Provider.OPENAI)
-      case "grok" =>
-        currentImageProvider = "grok"
-        imageTool.setProvider(ImageGenerationTool.Provider.GROK)
-      case _ => // keep current
+  private def createImageToolSession(isPremium: Boolean, config: ProviderConfig): ImageToolSession = {
+    if ("claude".equalsIgnoreCase(config.providerType)) {
+      return ImageToolSession(None, None, new ImageGenerationTool.AttachmentCollector())
+    }
+    val selectedModel = if (isPremium) premiumImageModel else freeImageModel
+    val provider = providerFromString(selectedModel.provider)
+    provider match {
+      case Some(p) =>
+        val attachmentCollector = new ImageGenerationTool.AttachmentCollector()
+        val tool: ImageGenerationTool = p match {
+          case ImageGenerationTool.Provider.OPENAI =>
+            new OpenAiImageGenerationTool(
+              openAiImageModel = imageToolDependencies.openAiImageModel,
+              openAiModelName = defaultOpenAiImageModel,
+              firebaseStorageUploader = firebaseStorageUploader,
+              attachmentCollector = attachmentCollector
+            )
+          case ImageGenerationTool.Provider.GEMINI =>
+            new GeminiImageGenerationTool(
+              geminiImageModel = imageToolDependencies.geminiImageModel,
+              geminiModelName = defaultGeminiImageModel,
+              firebaseStorageUploader = firebaseStorageUploader,
+              attachmentCollector = attachmentCollector
+            )
+          case ImageGenerationTool.Provider.GROK =>
+            new GrokImageGenerationTool(
+              grokImageModel = imageToolDependencies.grokImageModel,
+              grokModelName = defaultGrokImageModel,
+              firebaseStorageUploader = firebaseStorageUploader,
+              attachmentCollector = attachmentCollector
+            )
+          case ImageGenerationTool.Provider.QWEN =>
+            new QwenImageGenerationTool(
+              qwenApiKey = imageToolDependencies.qwenApiKey,
+              qwenCreateModelName = defaultQwenCreateImageModel,
+              qwenEditModelName = defaultQwenEditImageModel,
+              qwenApiBaseUrl = ModelFactory.qwenApiBaseUrl,
+              firebaseStorageUploader = firebaseStorageUploader,
+              attachmentCollector = attachmentCollector
+            )
+        }
+        ImageToolSession(Some(new ImageGenerationTool.ExposedTool(tool)), Some(tool), attachmentCollector)
+      case None =>
+        ImageToolSession(None, None, new ImageGenerationTool.AttachmentCollector())
     }
   }
 
-  private def refreshImageModels(): Unit = {
+  private def providerFromString(provider: String): Option[ImageGenerationTool.Provider] = {
+    if (provider == null) {
+      None
+    } else if (provider.equalsIgnoreCase("gemini")) {
+      Some(ImageGenerationTool.Provider.GEMINI)
+    } else if (provider.equalsIgnoreCase("qwen")) {
+      Some(ImageGenerationTool.Provider.QWEN)
+    } else if (provider.equalsIgnoreCase("grok")) {
+      Some(ImageGenerationTool.Provider.GROK)
+    } else if (provider.equalsIgnoreCase("openai") || provider.equalsIgnoreCase("chatgpt")) {
+      Some(ImageGenerationTool.Provider.OPENAI)
+    } else {
+      None
+    }
+  }
+
+  private def loadImageToolDependencies(): ImageToolDependencies = {
     val openAiKey = ModelsConfig.getOpenAiKey
     val openAiModel: ImageModel = if (openAiKey == null || openAiKey.isBlank) {
       new DisabledImageModel()
     } else {
-      ModelFactory.createImageModel(openAiKey, currentOpenAiImageModel)
+      ModelFactory.createImageModel(openAiKey, defaultOpenAiImageModel)
     }
 
     val geminiKey = ModelsConfig.getGeminiKey
     val geminiModel: ChatModel = if (geminiKey == null || geminiKey.isBlank) {
       null
     } else {
-      ModelFactory.createGeminiImageModel(geminiKey, currentGeminiImageModel)
+      ModelFactory.createGeminiImageModel(geminiKey, defaultGeminiImageModel)
     }
 
     val grokKey = ModelsConfig.getGrokKey
     val grokModel: ImageModel = if (grokKey == null || grokKey.isBlank) {
       new DisabledImageModel()
     } else {
-      ModelFactory.createGrokImageModel(grokKey, currentGrokImageModel)
+      ModelFactory.createGrokImageModel(grokKey, defaultGrokImageModel)
     }
 
-    imageTool.setOpenAiImageModel(openAiModel, currentOpenAiImageModel)
-    imageTool.setGeminiImageModel(geminiModel, currentGeminiImageModel)
-    imageTool.setGrokImageModel(grokModel, currentGrokImageModel)
+    val aliBabaKey = ModelsConfig.getAliBabaKey
+
+    ImageToolDependencies(
+      openAiImageModel = openAiModel,
+      geminiImageModel = geminiModel,
+      grokImageModel = grokModel,
+      qwenApiKey = aliBabaKey
+    )
   }
 
-  private def configureFirebaseStorage(): Unit = {
+  private def createFirebaseStorageUploader(): FirebaseStorageUploader = {
     val uploader = new FirebaseStorageUploader(
       FirebaseConfig.getServiceAccountPath,
       FirebaseConfig.getStorageBucket
     )
-    if (uploader.isConfigured) {
-      imageTool.setFirebaseStorageUploader(uploader)
-    }
+    uploader
   }
 
   private def createDocumentContextService(): DocumentContextService = {
@@ -349,12 +365,22 @@ class DefaultChatBackend extends ChatBackend {
   // Message enrichment and attachment handling
   // ----------------------------------------------------------------
 
-  private def enrichMessageForModel(conversationId: String, message: String, attachments: List[MessageAttachment]): String = {
-    val enriched = enrichMessageWithLatestImageAttachment(conversationId, message, attachments)
+  private def enrichMessageForModel(
+    conversationId: String,
+    message: String,
+    attachments: List[MessageAttachment],
+    promptImageIntent: PromptImageIntent
+  ): String = {
+    val enriched = enrichMessageWithLatestImageAttachment(conversationId, message, attachments, promptImageIntent)
     enrichMessageWithLatestDocumentContext(conversationId, enriched, message, attachments)
   }
 
-  private def enrichMessageWithLatestImageAttachment(conversationId: String, message: String, attachments: List[MessageAttachment]): String = {
+  private def enrichMessageWithLatestImageAttachment(
+    conversationId: String,
+    message: String,
+    attachments: List[MessageAttachment],
+    promptImageIntent: PromptImageIntent
+  ): String = {
     if (extractFirstUrl(message) != null) {
       return message
     }
@@ -364,9 +390,13 @@ class DefaultChatBackend extends ChatBackend {
     }
     val shouldInjectImageUrl =
       containsAttachmentType(attachments, "image") ||
-        referencesImage(message) ||
-        isImageEditRequest(message) ||
-        isImageFollowUpRequest(message)
+        (promptImageIntent match {
+          case PromptImageIntent.EDIT_EXISTING => true
+          case PromptImageIntent.GENERATE_NEW  => false
+          case PromptImageIntent.NONE          => false
+          case PromptImageIntent.UNKNOWN =>
+            referencesImage(message) || isImageEditRequest(message) || isImageFollowUpRequest(message)
+        })
     if (!shouldInjectImageUrl) {
       return message
     }
@@ -463,8 +493,11 @@ class DefaultChatBackend extends ChatBackend {
     findLatestAttachmentByType(attachments, attachmentType) != null
   }
 
-  private def consumeToolAttachments(conversationId: String): List[MessageAttachment] = {
-    val toolAttachments = imageTool.consumePendingAttachments()
+  private def consumeToolAttachments(conversationId: String, imageToolSession: ImageToolSession): List[MessageAttachment] = {
+    if (!imageToolSession.includeImageTools) {
+      return Nil
+    }
+    val toolAttachments = imageToolSession.attachmentCollector.drain()
     if (toolAttachments.isEmpty) {
       return Nil
     }
@@ -641,37 +674,89 @@ class DefaultChatBackend extends ChatBackend {
     actionVerb && imageNoun
   }
 
-  private def shouldRejectImageRequestForNonPremium(
-    isPremium: Boolean,
-    conversationId: String,
+  private def shouldAttemptDirectImageToolFallback(
     message: String,
-    attachments: List[MessageAttachment]
+    responseText: String,
+    attachments: List[MessageAttachment],
+    error: String,
+    imageToolSession: ImageToolSession,
+    promptImageIntent: PromptImageIntent
   ): Boolean = {
-    if (isPremium) {
+    if (!imageToolSession.includeImageTools || imageToolSession.rawTool.isEmpty) {
       return false
     }
-    if (isImageGenerationRequest(message)) {
-      return true
+    if (imageToolSession.rawTool.exists(_.hasExecutedInSession)) {
+      return false
     }
-    isImageEditRequest(message) &&
-      (referencesImage(message) ||
-        containsAttachmentType(attachments, "image") ||
-        findLatestImageAttachmentUrl(conversationId, attachments) != null)
+    if (error != null && !error.isBlank) {
+      return false
+    }
+    if (attachments != null && attachments.nonEmpty) {
+      return false
+    }
+    val imageIntent = promptImageIntent match {
+      case PromptImageIntent.GENERATE_NEW | PromptImageIntent.EDIT_EXISTING => true
+      case PromptImageIntent.NONE                                            => isImageGenerationRequest(message) || isImageEditRequest(message)
+      case PromptImageIntent.UNKNOWN                                         => isImageGenerationRequest(message) || isImageEditRequest(message)
+    }
+    if (!imageIntent) {
+      return false
+    }
+    // For image intent, no image attachment means generation/edit did not complete.
+    // Always force a direct tool call so users get deterministic provider output/error.
+    true
   }
 
-  private def denyNonPremiumImageRequest(
+  private def runDirectImageToolFallback(
     conversationId: String,
     message: String,
+    messageForModel: String,
     attachments: List[MessageAttachment],
-    streamHandler: ChatStreamHandler
-  ): ChatResult = {
-    conversationRepository.addMessage(conversationId, UserMessage.from(message))
-    if (attachments.nonEmpty) {
-      conversationRepository.attachToLatestUserMessage(conversationId, attachments)
+    imageToolSession: ImageToolSession,
+    promptImageIntent: PromptImageIntent
+  ): String = {
+    val tool = imageToolSession.rawTool.orNull
+    if (tool == null) {
+      return null
     }
-    conversationRepository.addMessage(conversationId, AiMessage.from(NonPremiumImageDeniedMessage))
-    streamHandler.onToken(NonPremiumImageDeniedMessage)
-    ChatResult(Nil, null)
+    val latestImageUrl = findLatestImageAttachmentUrl(conversationId, attachments)
+    val shouldUseEdit = promptImageIntent == PromptImageIntent.EDIT_EXISTING && latestImageUrl != null && !latestImageUrl.isBlank
+    if (shouldUseEdit) {
+      tool.editImage(latestImageUrl, message)
+    } else {
+      tool.generateImage(messageForModel)
+    }
+  }
+
+  private def classifyPromptImageIntent(config: ProviderConfig, message: String): PromptImageIntent = {
+    if (message == null || message.isBlank) {
+      return PromptImageIntent.NONE
+    }
+    try {
+      val classifierPrompt =
+        imageIntentClassifierPrompt + "\n\nUser message:\n" + message + "\n\nLabel:"
+      val response: ChatResponse = ModelFactory.createModel(config).chat(UserMessage.from(classifierPrompt))
+      val raw = Option(response.aiMessage()).map(_.text()).getOrElse("")
+      normalizeIntentLabel(raw)
+    } catch {
+      case _: Exception => PromptImageIntent.UNKNOWN
+    }
+  }
+
+  private def normalizeIntentLabel(raw: String): PromptImageIntent = {
+    if (raw == null) {
+      return PromptImageIntent.UNKNOWN
+    }
+    val upper = raw.trim.toUpperCase
+    if (upper.startsWith("GENERATE_NEW")) {
+      PromptImageIntent.GENERATE_NEW
+    } else if (upper.startsWith("EDIT_EXISTING")) {
+      PromptImageIntent.EDIT_EXISTING
+    } else if (upper.startsWith("NONE")) {
+      PromptImageIntent.NONE
+    } else {
+      PromptImageIntent.UNKNOWN
+    }
   }
 
   private def referencesImage(message: String): Boolean = {
@@ -735,4 +820,19 @@ class DefaultChatBackend extends ChatBackend {
   }
 
   private case class ImagePayload(bytes: Array[Byte], mimeType: String)
+
+  private case class ImageToolDependencies(
+    openAiImageModel: ImageModel,
+    geminiImageModel: ChatModel,
+    grokImageModel: ImageModel,
+    qwenApiKey: String
+  )
+
+  private case class ImageToolSession(
+    tool: Option[AnyRef],
+    rawTool: Option[ImageGenerationTool],
+    attachmentCollector: ImageGenerationTool.AttachmentCollector
+  ) {
+    def includeImageTools: Boolean = tool.isDefined
+  }
 }

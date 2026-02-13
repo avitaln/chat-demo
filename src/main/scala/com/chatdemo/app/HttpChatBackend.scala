@@ -2,7 +2,7 @@ package com.chatdemo.app
 
 import com.chatdemo.common.config.ProviderConfig
 import com.chatdemo.common.model.{ConversationMessage, MessageAttachment}
-import com.chatdemo.common.service.{ChatBackend, ChatResult, ChatStreamHandler, ImageModelStatus}
+import com.chatdemo.common.service.{ChatBackend, ChatResult, ChatStreamHandler, ExposedImageModel, ImageModelAccessPolicy}
 import com.fasterxml.jackson.databind.ObjectMapper
 
 import java.io.{BufferedReader, InputStreamReader}
@@ -18,12 +18,18 @@ import scala.jdk.CollectionConverters.*
  * ChatBackend implementation that delegates to the HTTP server.
  * Stateless: model selection and attachments are sent per-request.
  */
-class HttpChatBackend(baseUrl: String) extends ChatBackend {
+class HttpChatBackend(baseUrl: String) extends ChatBackend with ImageModelAccessPolicy {
 
   private val normalizedUrl: String =
     if (baseUrl.endsWith("/")) baseUrl.substring(0, baseUrl.length - 1) else baseUrl
   private val httpClient: HttpClient = HttpClient.newHttpClient()
   private val mapper: ObjectMapper = new ObjectMapper()
+  private val defaultGeminiImageModel = "gemini-2.5-flash-image"
+  private val defaultQwenImageModel = "qwen-image-max"
+
+  override def premiumImageModel: ExposedImageModel = ExposedImageModel("gemini", defaultGeminiImageModel)
+
+  override def freeImageModel: ExposedImageModel = ExposedImageModel("qwen", defaultQwenImageModel)
 
   // ----------------------------------------------------------------
   // Conversation management
@@ -219,18 +225,6 @@ class HttpChatBackend(baseUrl: String) extends ChatBackend {
       case e: Exception =>
         throw operationFailure("clear conversation", e)
     }
-  }
-
-  // ----------------------------------------------------------------
-  // Image model (delegated to server)
-  // ----------------------------------------------------------------
-
-  override def getImageModelStatus: ImageModelStatus = {
-    ImageModelStatus("unknown", "unknown", "unknown", "unknown", "unknown", "unknown")
-  }
-
-  override def setImageModel(provider: String, modelName: String): ImageModelStatus = {
-    getImageModelStatus
   }
 
   // ----------------------------------------------------------------

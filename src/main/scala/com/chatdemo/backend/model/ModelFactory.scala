@@ -13,9 +13,12 @@ import dev.langchain4j.model.openai.{OpenAiChatModel, OpenAiImageModel, OpenAiSt
 object ModelFactory {
 
   private val GrokBaseUrl = "https://api.x.ai/v1"
+  private val QwenApiBaseUrl = "https://dashscope-intl.aliyuncs.com/api/v1"
   private val OpenAiImageModelName = "dall-e-3"
   private val GeminiImageModelName = "gemini-2.5-flash-image"
   private val GrokImageModelName = "grok-imagine-image"
+  private val QwenCreateImageModelName = "qwen-image-max"
+  private val QwenEditImageModelName = "qwen-image-edit-max"
 
   /** Create a ChatModel based on the provider configuration. */
   def createModel(config: ProviderConfig): ChatModel = {
@@ -68,9 +71,21 @@ object ModelFactory {
       .build()
   }
 
+  def createQwenImageModel(apiKey: String, modelName: String): ImageModel = {
+    OpenAiImageModel.builder()
+      .apiKey(apiKey)
+      .modelName(modelName)
+      .baseUrl("https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
+      .responseFormat("url")
+      .build()
+  }
+
   def defaultOpenAiImageModel: String = OpenAiImageModelName
   def defaultGeminiImageModel: String = GeminiImageModelName
   def defaultGrokImageModel: String = GrokImageModelName
+  def defaultQwenCreateImageModel: String = QwenCreateImageModelName
+  def defaultQwenEditImageModel: String = QwenEditImageModelName
+  def qwenApiBaseUrl: String = QwenApiBaseUrl
 
   private def createGeminiModel(config: ProviderConfig): ChatModel = {
     GoogleAiGeminiChatModel.builder()

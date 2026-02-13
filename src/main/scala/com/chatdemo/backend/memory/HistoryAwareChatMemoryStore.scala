@@ -6,6 +6,7 @@ import dev.langchain4j.data.message.{AiMessage, ChatMessage, SystemMessage, User
 import dev.langchain4j.store.memory.chat.ChatMemoryStore
 
 import java.util.{List => JList}
+import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters.*
 
 /**
@@ -45,7 +46,7 @@ class HistoryAwareChatMemoryStore(private val repository: ConversationRepository
 
   override def updateMessages(memoryId: AnyRef, messages: JList[ChatMessage]): Unit = {
     val conversationId = memoryId.toString
-    val currentMessages = repository.getActiveMessages(conversationId)
+    val currentMessages = ArrayBuffer.from(repository.getActiveMessages(conversationId))
 
     for (message <- messages.asScala) {
       // Skip summary system messages
@@ -58,6 +59,7 @@ class HistoryAwareChatMemoryStore(private val repository: ConversationRepository
         case _ =>
           if (!isNoiseMessage(message) && !containsMessage(currentMessages, message)) {
             repository.addMessage(conversationId, message)
+            currentMessages.append(message)
           }
       }
     }
@@ -84,19 +86,25 @@ class HistoryAwareChatMemoryStore(private val repository: ConversationRepository
     repository.getFullHistory(conversationId)
   }
 
-  private def containsMessage(messages: List[ChatMessage], target: ChatMessage): Boolean = {
+  private def containsMessage(messages: scala.collection.Iterable[ChatMessage], target: ChatMessage): Boolean = {
     messages.exists(msg => messagesEqual(msg, target))
   }
 
   private def isNoiseMessage(message: ChatMessage): Boolean = {
+    def containsToolResultMarker(text: String): Boolean = {
+      text != null && text.contains("ToolExecutionResultMessage")
+    }
+
     message match {
       case ai: AiMessage =>
         val text = ai.text()
-        text == null || text.isBlank
+        text == null || text.isBlank || containsToolResultMarker(text)
       case user: UserMessage =>
         val text = user.singleText()
-        text == null || text.isBlank || text.startsWith("ToolExecutionResultMessage")
-      case _ => false
+        text == null || text.isBlank || containsToolResultMarker(text)
+      case other =>
+        val text = other.toString
+        text == null || text.isBlank || containsToolResultMarker(text)
     }
   }
 

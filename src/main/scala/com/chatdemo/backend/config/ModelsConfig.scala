@@ -12,6 +12,7 @@ object ModelsConfig {
   private val openaiKey: String = System.getenv("OPENAI_API_KEY")
   private val claudeKey: String = System.getenv("ANTHROPIC_API_KEY")
   private val grokKey: String   = System.getenv("XAI_API_KEY")
+  private val aliBabaKey: String = System.getenv("ALI_BABA_KEY")
 
   /**
    * List of configured AI providers.
@@ -26,4 +27,5 @@ object ModelsConfig {
   def getOpenAiKey: String = openaiKey
   def getGeminiKey: String = geminiKey
   def getGrokKey: String = grokKey
+  def getAliBabaKey: String = aliBabaKey
 }

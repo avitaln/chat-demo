@@ -1,8 +1,7 @@
 package com.chatdemo.app
 
-import com.chatdemo.common.config.ProviderConfig
 import com.chatdemo.common.model.{ConversationMessage, MessageAttachment, MessageAttachmentExtractor}
-import com.chatdemo.common.service.{ChatBackend, ChatResult, ImageModelStatus}
+import com.chatdemo.common.service.ChatBackend
 
 import java.util.{Locale, Scanner}
 import scala.collection.mutable.ArrayBuffer
@@ -52,14 +51,10 @@ class ChatApplication(private val backend: ChatBackend) {
         handleClear()
       } else if (input.equalsIgnoreCase("/help")) {
         printHelp()
-      } else if (input.toLowerCase.startsWith("/create")) {
-        handleCreate(input)
-      } else if (input.toLowerCase.startsWith("/load")) {
-        handleLoad(input)
-      } else if (input.equalsIgnoreCase("/conversations")) {
-        handleListConversations()
-      } else if (input.toLowerCase.startsWith("/imagemodel")) {
-        handleImageModel(input)
+      } else if (input.equalsIgnoreCase("/c") || input.toLowerCase(Locale.ROOT).startsWith("/c ")) {
+        handleConversationCommand(input)
+      } else if (input.equalsIgnoreCase("/dump")) {
+        handleDump()
       } else if (input.toLowerCase.startsWith("/attach")) {
         handleAttachCommand(input)
       } else if (input.toLowerCase.startsWith("/premium")) {
@@ -86,17 +81,16 @@ class ChatApplication(private val backend: ChatBackend) {
       println("Current model: " + models(currentModelIndex).getDisplayName)
     }
     println()
-    println("Use /create <id> to start a new conversation, or /load <id> to resume one.")
+    println("Use /c <id> to create or load a conversation, or /c to list all conversations.")
   }
 
   private def printHelp(): Unit = {
     println("Commands:")
-    println("  /create <id>  - Create a new conversation")
-    println("  /load <id>    - Load an existing conversation")
-    println("  /conversations - List all conversations")
+    println("  /c <id>       - Create or load a conversation")
+    println("  /c            - List all conversations")
+    println("  /dump         - Dump current conversation messages")
     println("  /setmodel     - Switch AI model")
     println("  /premium      - Set premium mode (on|off)")
-    println("  /imagemodel   - Switch image model (openai|gemini|grok)")
     println("  /attach <url> - Stage attachment for next message")
     println("  /clear        - Clear current conversation history")
     println("  /help         - Show this help")
@@ -107,10 +101,10 @@ class ChatApplication(private val backend: ChatBackend) {
   // Conversation commands
   // ----------------------------------------------------------------
 
-  private def handleCreate(input: String): Unit = {
+  private def handleConversationCommand(input: String): Unit = {
     val parts = input.trim.split("\\s+", 2)
     if (parts.length < 2 || parts(1).isBlank) {
-      println("Usage: /create <conversation-id>")
+      handleListConversations()
       return
     }
     val id = parts(1).trim
@@ -119,21 +113,14 @@ class ChatApplication(private val backend: ChatBackend) {
     if (created) {
       println("Created conversation: " + id)
     } else {
-      println("Conversation already exists, switched to: " + id)
+      val history = backend.getConversationHistory(id)
+      printConversationPreview(id, history)
     }
   }
 
-  private def handleLoad(input: String): Unit = {
-    val parts = input.trim.split("\\s+", 2)
-    if (parts.length < 2 || parts(1).isBlank) {
-      println("Usage: /load <conversation-id>")
-      return
-    }
-    val id = parts(1).trim
-    val history = backend.getConversationHistory(id)
-    currentConversationId = id
+  private def printConversationPreview(id: String, history: List[ConversationMessage]): Unit = {
     if (history.isEmpty) {
-      println(s"Loaded conversation: $id (empty - use /create to start fresh)")
+      println(s"Loaded conversation: $id (empty)")
     } else {
       println(s"Loaded conversation: $id (${history.size} messages)")
       val start = Math.max(0, history.size - 6)
@@ -153,12 +140,37 @@ class ChatApplication(private val backend: ChatBackend) {
   private def handleListConversations(): Unit = {
     val ids = backend.listConversations()
     if (ids.isEmpty) {
-      println("No conversations yet. Use /create <id> to start one.")
+      println("No conversations yet. Use /c <id> to start one.")
     } else {
       println("Conversations:")
       for (id <- ids) {
         val marker = if (id == currentConversationId) " [active]" else ""
         println(s"  - $id$marker")
+      }
+    }
+  }
+
+  private def handleDump(): Unit = {
+    if (currentConversationId == null) {
+      println("No active conversation. Use /c <id> first.")
+      return
+    }
+    val history = backend.getConversationHistory(currentConversationId)
+    if (history.isEmpty) {
+      println(s"Conversation '$currentConversationId' has no messages.")
+      return
+    }
+    println(s"Dumping conversation: $currentConversationId (${history.size} messages)")
+    for (msg <- history) {
+      val role = messageRole(msg)
+      val text = messageText(msg)
+      println(s"[$role] $text")
+      if (msg.attachments != null && msg.attachments.nonEmpty) {
+        for (attachment <- msg.attachments) {
+          val t = if (attachment.attachmentType == null) "link" else attachment.attachmentType.toLowerCase(Locale.ROOT)
+          val mime = if (attachment.mimeType == null) "" else s" (${attachment.mimeType})"
+          println(s"  -> attachment [$t] ${attachment.url}$mime")
+        }
       }
     }
   }
@@ -196,7 +208,7 @@ class ChatApplication(private val backend: ChatBackend) {
 
   private def handleClear(): Unit = {
     if (currentConversationId == null) {
-      println("No active conversation. Use /create or /load first.")
+      println("No active conversation. Use /c <id> first.")
       return
     }
     backend.clearConversation(currentConversationId)
@@ -205,7 +217,7 @@ class ChatApplication(private val backend: ChatBackend) {
 
   private def handleChat(message: String): Unit = {
     if (currentConversationId == null) {
-      println("No active conversation. Use /create <id> or /load <id> first.")
+      println("No active conversation. Use /c <id> first.")
       return
     }
 
@@ -241,7 +253,7 @@ class ChatApplication(private val backend: ChatBackend) {
 
   private def handleAttachCommand(input: String): Unit = {
     if (currentConversationId == null) {
-      println("No active conversation. Use /create or /load first.")
+      println("No active conversation. Use /c <id> first.")
       return
     }
     val parts = input.trim.split("\\s+", 2)
@@ -256,37 +268,6 @@ class ChatApplication(private val backend: ChatBackend) {
     }
     pendingAttachments.append(attachment)
     println(s"Attachment staged: [${attachment.attachmentType}] ${attachment.url}")
-  }
-
-  private def handleImageModel(input: String): Unit = {
-    val parts = input.trim.split("\\s+")
-    if (parts.length == 1) {
-      printImageModelStatus()
-      return
-    }
-
-    val provider = parts(1).toLowerCase
-    val modelName = if (parts.length >= 3) parts(2) else null
-
-    provider match {
-      case "openai" | "dall-e" | "dalle" =>
-        val status = backend.setImageModel("openai", modelName)
-        println(s"Image model set to OpenAI (${status.openAiModelName})")
-      case "gemini" =>
-        val status = backend.setImageModel("gemini", modelName)
-        println(s"Image model set to Gemini (${status.geminiModelName})")
-      case "grok" =>
-        val status = backend.setImageModel("grok", modelName)
-        println(s"Image model set to Grok (${status.grokModelName})")
-      case _ =>
-        val status = backend.getImageModelStatus
-        println("Unknown image model provider. Use /imagemodel openai, /imagemodel gemini, or /imagemodel grok.")
-        println("Examples:")
-        println("  /imagemodel openai")
-        println("  /imagemodel gemini")
-        println("  /imagemodel grok")
-        println(s"  /imagemodel gemini ${status.defaultGeminiModelName}")
-    }
   }
 
   private def handlePremium(input: String): Unit = {
@@ -307,20 +288,6 @@ class ChatApplication(private val backend: ChatBackend) {
       case _ =>
         println("Usage: /premium on|off")
     }
-  }
-
-  private def printImageModelStatus(): Unit = {
-    val status = backend.getImageModelStatus
-    println("Image model providers:")
-    println(s"  OpenAI: ${status.openAiModelName}")
-    println(s"  Gemini: ${status.geminiModelName}")
-    println(s"  Grok: ${status.grokModelName}")
-    println(s"Current image provider: ${status.currentProvider} (${status.currentModelName})")
-    println("Examples:")
-    println("  /imagemodel openai")
-    println("  /imagemodel gemini")
-    println("  /imagemodel grok")
-    println(s"  /imagemodel gemini ${status.defaultGeminiModelName}")
   }
 
   // ----------------------------------------------------------------
