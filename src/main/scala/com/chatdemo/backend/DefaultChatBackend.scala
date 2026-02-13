@@ -41,6 +41,8 @@ import scala.jdk.CollectionConverters.*
 class DefaultChatBackend extends ChatBackend {
 
   private val MaxTokens = 4000
+  private val NonPremiumImageDeniedMessage =
+    "System: Image generation and image editing are available for premium users only."
   private val UrlPattern: Pattern = Pattern.compile("(https?://\\S+)")
 
   // --- Immutable / shared infrastructure (safe across requests) ---
@@ -109,6 +111,7 @@ class DefaultChatBackend extends ChatBackend {
     message: String,
     attachments: List[MessageAttachment],
     modelIndex: Int,
+    isPremium: Boolean,
     streamHandler: ChatStreamHandler
   ): ChatResult = {
     conversationRepository.createConversation(conversationId)
@@ -117,6 +120,17 @@ class DefaultChatBackend extends ChatBackend {
     val currentConfig = configs(safeModelIndex)
     val providerName = currentConfig.getDisplayName.split(" ")(0)
     val modelName = currentConfig.model
+
+    if (shouldRejectImageRequestForNonPremium(isPremium, conversationId, message, attachments)) {
+      val denied = denyNonPremiumImageRequest(conversationId, message, attachments, streamHandler)
+      llmExchangeLogger.logExchange(
+        providerName, modelName, message, message,
+        List("[system] " + NonPremiumImageDeniedMessage, "[user] " + safeMessage(message)),
+        NonPremiumImageDeniedMessage, Nil, null
+      )
+      return denied
+    }
+
     val systemPrompt = getSystemPromptForRequest(conversationId, message)
     val messageForModel = enrichMessageForModel(conversationId, message, attachments)
     val effectivePayload = buildEffectivePayload(conversationId, systemPrompt, messageForModel)
@@ -625,6 +639,39 @@ class DefaultChatBackend extends ChatBackend {
         lower.contains("illustration") ||
         lower.contains("logo")
     actionVerb && imageNoun
+  }
+
+  private def shouldRejectImageRequestForNonPremium(
+    isPremium: Boolean,
+    conversationId: String,
+    message: String,
+    attachments: List[MessageAttachment]
+  ): Boolean = {
+    if (isPremium) {
+      return false
+    }
+    if (isImageGenerationRequest(message)) {
+      return true
+    }
+    isImageEditRequest(message) &&
+      (referencesImage(message) ||
+        containsAttachmentType(attachments, "image") ||
+        findLatestImageAttachmentUrl(conversationId, attachments) != null)
+  }
+
+  private def denyNonPremiumImageRequest(
+    conversationId: String,
+    message: String,
+    attachments: List[MessageAttachment],
+    streamHandler: ChatStreamHandler
+  ): ChatResult = {
+    conversationRepository.addMessage(conversationId, UserMessage.from(message))
+    if (attachments.nonEmpty) {
+      conversationRepository.attachToLatestUserMessage(conversationId, attachments)
+    }
+    conversationRepository.addMessage(conversationId, AiMessage.from(NonPremiumImageDeniedMessage))
+    streamHandler.onToken(NonPremiumImageDeniedMessage)
+    ChatResult(Nil, null)
   }
 
   private def referencesImage(message: String): Boolean = {

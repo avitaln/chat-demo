@@ -36,5 +36,8 @@ lazy val root = (project in file("."))
     // Fork a separate JVM for run/runMain so that sbt's own JLine
     // input handling does not interfere with Scanner(System.in).
     run / fork := true,
-    run / connectInput := true
+    run / connectInput := true,
+
+    // Print application stdout directly (no sbt "[info]" prefixes).
+    run / outputStrategy := Some(StdoutOutput)
   )

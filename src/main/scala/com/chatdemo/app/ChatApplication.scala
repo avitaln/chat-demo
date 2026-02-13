@@ -23,6 +23,7 @@ class ChatApplication(private val backend: ChatBackend) {
 
   private var currentConversationId: String = _
   private var currentModelIndex: Int = 0
+  private var currentUserPremium: Boolean = false
   private val pendingAttachments: ArrayBuffer[MessageAttachment] = ArrayBuffer.empty
 
   def run(): Unit = {
@@ -61,6 +62,8 @@ class ChatApplication(private val backend: ChatBackend) {
         handleImageModel(input)
       } else if (input.toLowerCase.startsWith("/attach")) {
         handleAttachCommand(input)
+      } else if (input.toLowerCase.startsWith("/premium")) {
+        handlePremium(input)
       } else if (input.startsWith("/")) {
         println("Unknown command. Type /help for available commands.")
       } else {
@@ -92,6 +95,7 @@ class ChatApplication(private val backend: ChatBackend) {
     println("  /load <id>    - Load an existing conversation")
     println("  /conversations - List all conversations")
     println("  /setmodel     - Switch AI model")
+    println("  /premium      - Set premium mode (on|off)")
     println("  /imagemodel   - Switch image model (openai|gemini|grok)")
     println("  /attach <url> - Stage attachment for next message")
     println("  /clear        - Clear current conversation history")
@@ -218,7 +222,7 @@ class ChatApplication(private val backend: ChatBackend) {
     val attachments = pendingAttachments.toList
     pendingAttachments.clear()
 
-    val result = backend.chat(currentConversationId, message, attachments, currentModelIndex,
+    val result = backend.chat(currentConversationId, message, attachments, currentModelIndex, currentUserPremium,
       new com.chatdemo.common.service.ChatStreamHandler {
         override def onToken(token: String): Unit = {
           print(token)
@@ -282,6 +286,26 @@ class ChatApplication(private val backend: ChatBackend) {
         println("  /imagemodel gemini")
         println("  /imagemodel grok")
         println(s"  /imagemodel gemini ${status.defaultGeminiModelName}")
+    }
+  }
+
+  private def handlePremium(input: String): Unit = {
+    val parts = input.trim.split("\\s+")
+    if (parts.length == 1) {
+      val status = if (currentUserPremium) "on" else "off"
+      println(s"Premium mode is currently: $status")
+      println("Usage: /premium on|off")
+      return
+    }
+    parts(1).toLowerCase match {
+      case "on" | "true" | "1" =>
+        currentUserPremium = true
+        println("Premium mode enabled.")
+      case "off" | "false" | "0" =>
+        currentUserPremium = false
+        println("Premium mode disabled.")
+      case _ =>
+        println("Usage: /premium on|off")
     }
   }
 

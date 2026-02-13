@@ -37,6 +37,7 @@ trait ChatBackend {
    * @param message        the user's message text
    * @param attachments    attachments for this turn (images as links, documents, etc.)
    * @param modelIndex     index into getAvailableModels for the model to use
+   * @param isPremium      whether the user has premium entitlement for gated features
    * @param streamHandler  callback that receives streaming tokens
    */
   def chat(
@@ -44,6 +45,7 @@ trait ChatBackend {
     message: String,
     attachments: List[MessageAttachment],
     modelIndex: Int,
+    isPremium: Boolean,
     streamHandler: ChatStreamHandler
   ): ChatResult
 

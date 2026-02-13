@@ -147,12 +147,14 @@ class HttpChatBackend(baseUrl: String) extends ChatBackend {
     message: String,
     attachments: List[MessageAttachment],
     modelIndex: Int,
+    isPremium: Boolean,
     streamHandler: ChatStreamHandler
   ): ChatResult = {
     try {
       val requestBody = new java.util.LinkedHashMap[String, AnyRef]()
       requestBody.put("message", message)
       requestBody.put("modelIndex", Int.box(modelIndex))
+      requestBody.put("isPremium", java.lang.Boolean.valueOf(isPremium))
       if (attachments.nonEmpty) {
         requestBody.put("attachments", attachments.map(serializeAttachment).asJava)
       }

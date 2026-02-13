@@ -99,6 +99,7 @@ class ChatRoutes(private val backend: ChatBackend) {
             }
             val requestAttachments = deserializeAttachments(body.get("attachments").asInstanceOf[java.util.List[_]])
             val modelIndex = parseModelIndex(body.get("modelIndex"))
+            val isPremium = parseBoolean(body.get("isPremium"))
 
             // SSE headers
             ex.getResponseHeaders.put(Headers.CONTENT_TYPE, "text/event-stream")
@@ -108,7 +109,7 @@ class ChatRoutes(private val backend: ChatBackend) {
             ex.startBlocking()
             val out: OutputStream = ex.getOutputStream
 
-            val result = backend.chat(id, message, requestAttachments, modelIndex, new ChatStreamHandler {
+            val result = backend.chat(id, message, requestAttachments, modelIndex, isPremium, new ChatStreamHandler {
               override def onToken(token: String): Unit = {
                 try {
                   val sseData = "data: " + mapper.writeValueAsString(JMap.of("token", token)) + "\n\n"
@@ -167,6 +168,16 @@ class ChatRoutes(private val backend: ChatBackend) {
       case s: String =>
         try { s.toInt } catch { case _: NumberFormatException => 0 }
       case _ => 0
+    }
+  }
+
+  private def parseBoolean(value: AnyRef): Boolean = {
+    if (value == null) return false
+    value match {
+      case b: java.lang.Boolean => b.booleanValue()
+      case s: String            => java.lang.Boolean.parseBoolean(s)
+      case n: Number            => n.intValue() != 0
+      case _                    => false
     }
   }
 
