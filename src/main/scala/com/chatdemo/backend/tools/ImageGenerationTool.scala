@@ -27,7 +27,8 @@ import scala.collection.mutable.ArrayBuffer
 abstract class ImageGenerationTool(
   val provider: ImageGenerationTool.Provider,
   val firebaseStorageUploader: FirebaseStorageUploader,
-  private val attachmentCollector: ImageGenerationTool.AttachmentCollector = new ImageGenerationTool.AttachmentCollector()
+  private val attachmentCollector: ImageGenerationTool.AttachmentCollector = new ImageGenerationTool.AttachmentCollector(),
+  private val onGenerationStarted: () => Unit = () => {}
 ) {
   private var providerExecutedInSession: Boolean = false
   private var cachedSessionResult: String = null
@@ -49,6 +50,7 @@ abstract class ImageGenerationTool(
       return cachedSessionResult
     }
     clearPendingAttachments()
+    onGenerationStarted()
     logToolCall("generate_image", s"provider=$provider, prompt=$prompt")
     try {
       val result = generateWithProvider(prompt)
@@ -80,6 +82,7 @@ abstract class ImageGenerationTool(
       return cachedSessionResult
     }
     clearPendingAttachments()
+    onGenerationStarted()
     logToolCall("edit_image", s"provider=$provider, model=$currentModelName, imageUrl=$imageUrl, prompt=$prompt")
     try {
       val result = editWithProvider(imageUrl, prompt)
@@ -295,11 +298,13 @@ final class OpenAiImageGenerationTool(
   openAiImageModel: ImageModel,
   openAiModelName: String,
   firebaseStorageUploader: FirebaseStorageUploader,
-  attachmentCollector: ImageGenerationTool.AttachmentCollector = new ImageGenerationTool.AttachmentCollector()
+  attachmentCollector: ImageGenerationTool.AttachmentCollector = new ImageGenerationTool.AttachmentCollector(),
+  onGenerationStarted: () => Unit = () => {}
 ) extends ImageGenerationTool(
   provider = ImageGenerationTool.Provider.OPENAI,
   firebaseStorageUploader = firebaseStorageUploader,
-  attachmentCollector = attachmentCollector
+  attachmentCollector = attachmentCollector,
+  onGenerationStarted = onGenerationStarted
 ) {
   override protected def currentModelName: String = openAiModelName
 
@@ -331,11 +336,13 @@ final class GeminiImageGenerationTool(
   geminiImageModel: ChatModel,
   geminiModelName: String,
   firebaseStorageUploader: FirebaseStorageUploader,
-  attachmentCollector: ImageGenerationTool.AttachmentCollector = new ImageGenerationTool.AttachmentCollector()
+  attachmentCollector: ImageGenerationTool.AttachmentCollector = new ImageGenerationTool.AttachmentCollector(),
+  onGenerationStarted: () => Unit = () => {}
 ) extends ImageGenerationTool(
   provider = ImageGenerationTool.Provider.GEMINI,
   firebaseStorageUploader = firebaseStorageUploader,
-  attachmentCollector = attachmentCollector
+  attachmentCollector = attachmentCollector,
+  onGenerationStarted = onGenerationStarted
 ) {
   override protected def currentModelName: String = geminiModelName
 
@@ -381,11 +388,13 @@ final class GrokImageGenerationTool(
   grokImageModel: ImageModel,
   grokModelName: String,
   firebaseStorageUploader: FirebaseStorageUploader,
-  attachmentCollector: ImageGenerationTool.AttachmentCollector = new ImageGenerationTool.AttachmentCollector()
+  attachmentCollector: ImageGenerationTool.AttachmentCollector = new ImageGenerationTool.AttachmentCollector(),
+  onGenerationStarted: () => Unit = () => {}
 ) extends ImageGenerationTool(
   provider = ImageGenerationTool.Provider.GROK,
   firebaseStorageUploader = firebaseStorageUploader,
-  attachmentCollector = attachmentCollector
+  attachmentCollector = attachmentCollector,
+  onGenerationStarted = onGenerationStarted
 ) {
   override protected def currentModelName: String = grokModelName
 
@@ -415,11 +424,13 @@ final class QwenImageGenerationTool(
   qwenEditModelName: String,
   qwenApiBaseUrl: String,
   firebaseStorageUploader: FirebaseStorageUploader,
-  attachmentCollector: ImageGenerationTool.AttachmentCollector = new ImageGenerationTool.AttachmentCollector()
+  attachmentCollector: ImageGenerationTool.AttachmentCollector = new ImageGenerationTool.AttachmentCollector(),
+  onGenerationStarted: () => Unit = () => {}
 ) extends ImageGenerationTool(
   provider = ImageGenerationTool.Provider.QWEN,
   firebaseStorageUploader = firebaseStorageUploader,
-  attachmentCollector = attachmentCollector
+  attachmentCollector = attachmentCollector,
+  onGenerationStarted = onGenerationStarted
 ) {
   private val mapper = new ObjectMapper()
 

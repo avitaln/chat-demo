@@ -14,6 +14,8 @@ lazy val root = (project in file("."))
       "dev.langchain4j" % "langchain4j-anthropic" % "1.11.0",
       // LangChain4j Google AI Gemini
       "dev.langchain4j" % "langchain4j-google-ai-gemini" % "1.11.0",
+      // Firebase Admin SDK (Firestore + Firebase app initialization)
+      "com.google.firebase" % "firebase-admin" % "9.7.0",
       // Google Cloud Storage client for image uploads
       "com.google.cloud" % "google-cloud-storage" % "2.62.1",
       // Jackson for JSON persistence

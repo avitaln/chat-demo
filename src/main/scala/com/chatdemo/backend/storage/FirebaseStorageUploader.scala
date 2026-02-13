@@ -1,31 +1,27 @@
 package com.chatdemo.backend.storage
 
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.google.auth.oauth2.GoogleCredentials
-import com.google.cloud.storage.{Acl, BlobId, BlobInfo, Storage, StorageOptions}
+import com.chatdemo.backend.config.FirebaseInitializer
+import com.google.cloud.storage.{Acl, BlobId, BlobInfo}
 
-import java.io.{FileInputStream, IOException}
-import java.nio.file.{Files, Path}
 import java.util.{Locale, UUID}
 
 /**
  * Uploads images to Firebase Storage and returns public URLs.
  */
-class FirebaseStorageUploader(serviceAccountPathStr: String, configuredBucket: String) {
+class FirebaseStorageUploader(firebase: FirebaseInitializer) {
 
-  private val serviceAccountPath: Path = Path.of(serviceAccountPathStr)
-  private val objectMapper = new ObjectMapper()
-  @volatile private var storage: Storage = _
+  def this(serviceAccountPathStr: String, configuredBucket: String) =
+    this(new FirebaseInitializer(serviceAccountPathStr, configuredBucket))
 
-  def isConfigured: Boolean = Files.exists(serviceAccountPath)
+  def isConfigured: Boolean = firebase.isConfigured
 
   def uploadBase64(bytes: Array[Byte], mimeType: String, provider: String, modelName: String): String = {
     try {
-      val client = getStorageClient()
-      val bucketName = resolveBucketName()
+      val bucketName = firebase.resolvedBucketName
       if (bucketName == null || bucketName.isBlank) {
         throw new IllegalStateException("Missing Firebase Storage bucket name.")
       }
+      val client = firebase.storage
       val objectPath = buildObjectPath(provider, modelName, mimeType)
       val blobInfo = BlobInfo.newBuilder(BlobId.of(bucketName, objectPath))
         .setContentType(mimeType)
@@ -37,45 +33,6 @@ class FirebaseStorageUploader(serviceAccountPathStr: String, configuredBucket: S
       case e: Exception =>
         throw new RuntimeException("Failed to upload image: " + e.getMessage, e)
     }
-  }
-
-  private def getStorageClient(): Storage = {
-    var current = storage
-    if (current != null) {
-      return current
-    }
-    this.synchronized {
-      if (storage != null) {
-        return storage
-      }
-      val inputStream = new FileInputStream(serviceAccountPath.toFile)
-      try {
-        val credentials = GoogleCredentials.fromStream(inputStream)
-        storage = StorageOptions.newBuilder()
-          .setCredentials(credentials)
-          .build()
-          .getService
-        storage
-      } finally {
-        inputStream.close()
-      }
-    }
-  }
-
-  private def resolveBucketName(): String = {
-    if (configuredBucket != null && !configuredBucket.isBlank) {
-      return configuredBucket
-    }
-    try {
-      val root = objectMapper.readTree(serviceAccountPath.toFile)
-      val projectId = root.get("project_id")
-      if (projectId != null && !projectId.asText().isBlank) {
-        return projectId.asText() + ".appspot.com"
-      }
-    } catch {
-      case _: IOException => return null
-    }
-    null
   }
 
   private def buildObjectPath(provider: String, modelName: String, mimeType: String): String = {

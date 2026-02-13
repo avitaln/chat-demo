@@ -1,6 +1,6 @@
 package com.chatdemo.app
 
-import com.chatdemo.common.model.{ConversationMessage, MessageAttachment, MessageAttachmentExtractor}
+import com.chatdemo.common.model.{Conversation, ConversationMessage, MessageAttachment, MessageAttachmentExtractor, UserContext}
 import com.chatdemo.common.service.ChatBackend
 
 import java.util.{Locale, Scanner}
@@ -20,9 +20,12 @@ class ChatApplication(private val backend: ChatBackend) {
   private val AnsiModel = "\u001B[38;5;214m"
   private val AnsiDim   = "\u001B[2m"
 
+  private val FreeUserContext = UserContext(isPremium = "false", deviceId = "device-free-001", signedInId = None)
+  private val PremiumAppleUserContext = UserContext(isPremium = "true", deviceId = "device-premium-001", signedInId = Some("apple-user-001"))
+
   private var currentConversationId: String = _
   private var currentModelIndex: Int = 0
-  private var currentUserPremium: Boolean = false
+  private var currentUserContext: UserContext = FreeUserContext
   private val pendingAttachments: ArrayBuffer[MessageAttachment] = ArrayBuffer.empty
 
   def run(): Unit = {
@@ -108,12 +111,12 @@ class ChatApplication(private val backend: ChatBackend) {
       return
     }
     val id = parts(1).trim
-    val created = backend.createConversation(id)
+    val created = backend.createConversation(currentUserContext, id)
     currentConversationId = id
     if (created) {
       println("Created conversation: " + id)
     } else {
-      val history = backend.getConversationHistory(id)
+      val history = backend.getConversationHistory(currentUserContext, id)
       printConversationPreview(id, history)
     }
   }
@@ -138,14 +141,13 @@ class ChatApplication(private val backend: ChatBackend) {
   }
 
   private def handleListConversations(): Unit = {
-    val ids = backend.listConversations()
-    if (ids.isEmpty) {
+    val conversations = backend.listConversations(currentUserContext)
+    if (conversations.isEmpty) {
       println("No conversations yet. Use /c <id> to start one.")
     } else {
       println("Conversations:")
-      for (id <- ids) {
-        val marker = if (id == currentConversationId) " [active]" else ""
-        println(s"  - $id$marker")
+      for (conversation <- conversations) {
+        printConversationListItem(conversation)
       }
     }
   }
@@ -155,7 +157,7 @@ class ChatApplication(private val backend: ChatBackend) {
       println("No active conversation. Use /c <id> first.")
       return
     }
-    val history = backend.getConversationHistory(currentConversationId)
+    val history = backend.getConversationHistory(currentUserContext, currentConversationId)
     if (history.isEmpty) {
       println(s"Conversation '$currentConversationId' has no messages.")
       return
@@ -211,7 +213,7 @@ class ChatApplication(private val backend: ChatBackend) {
       println("No active conversation. Use /c <id> first.")
       return
     }
-    backend.clearConversation(currentConversationId)
+    backend.clearConversation(currentUserContext, currentConversationId)
     println("Conversation history cleared. Starting fresh!")
   }
 
@@ -234,7 +236,7 @@ class ChatApplication(private val backend: ChatBackend) {
     val attachments = pendingAttachments.toList
     pendingAttachments.clear()
 
-    val result = backend.chat(currentConversationId, message, attachments, currentModelIndex, currentUserPremium,
+    val result = backend.chat(currentConversationId, message, attachments, currentModelIndex, currentUserContext,
       new com.chatdemo.common.service.ChatStreamHandler {
         override def onToken(token: String): Unit = {
           print(token)
@@ -273,18 +275,18 @@ class ChatApplication(private val backend: ChatBackend) {
   private def handlePremium(input: String): Unit = {
     val parts = input.trim.split("\\s+")
     if (parts.length == 1) {
-      val status = if (currentUserPremium) "on" else "off"
+      val status = if (currentUserContext.isPremium.toBoolean) "on (premium apple)" else "off (free)"
       println(s"Premium mode is currently: $status")
       println("Usage: /premium on|off")
       return
     }
     parts(1).toLowerCase match {
       case "on" | "true" | "1" =>
-        currentUserPremium = true
-        println("Premium mode enabled.")
+        currentUserContext = PremiumAppleUserContext
+        println(s"Switched to premium apple user (${currentUserContext.effectiveId}).")
       case "off" | "false" | "0" =>
-        currentUserPremium = false
-        println("Premium mode disabled.")
+        currentUserContext = FreeUserContext
+        println(s"Switched to free user (${currentUserContext.effectiveId}).")
       case _ =>
         println("Usage: /premium on|off")
     }
@@ -304,6 +306,14 @@ class ChatApplication(private val backend: ChatBackend) {
       val mime = if (attachment.mimeType == null) "" else s" (${attachment.mimeType})"
       println(s"- [$t] ${attachment.url}$mime")
     }
+  }
+
+  private def printConversationListItem(conversation: Conversation): Unit = {
+    val marker = if (conversation.id == currentConversationId) " [active]" else ""
+    val titlePart =
+      if (conversation.title == null || conversation.title.isBlank || conversation.title == conversation.id) ""
+      else s" - ${conversation.title}"
+    println(s"  - ${conversation.id}$titlePart$marker")
   }
 
   private def messageRole(msg: ConversationMessage): String = {

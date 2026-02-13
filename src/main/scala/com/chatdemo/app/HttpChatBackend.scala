@@ -1,7 +1,7 @@
 package com.chatdemo.app
 
 import com.chatdemo.common.config.ProviderConfig
-import com.chatdemo.common.model.{ConversationMessage, MessageAttachment}
+import com.chatdemo.common.model.{Conversation, ConversationMessage, MessageAttachment, UserContext}
 import com.chatdemo.common.service.{ChatBackend, ChatResult, ChatStreamHandler, ExposedImageModel, ImageModelAccessPolicy}
 import com.fasterxml.jackson.databind.ObjectMapper
 
@@ -9,7 +9,6 @@ import java.io.{BufferedReader, InputStreamReader}
 import java.net.URI
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.nio.charset.StandardCharsets
-import java.time.Instant
 import java.util.Objects
 import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters.*
@@ -35,11 +34,17 @@ class HttpChatBackend(baseUrl: String) extends ChatBackend with ImageModelAccess
   // Conversation management
   // ----------------------------------------------------------------
 
-  override def createConversation(conversationId: String): Boolean = {
+  override def createConversation(userContext: UserContext, conversationId: String): Boolean = {
     try {
+      val requestBody = new java.util.LinkedHashMap[String, AnyRef]()
+      requestBody.put("isPremium", userContext.isPremium)
+      requestBody.put("deviceId", userContext.deviceId)
+      userContext.signedInId.foreach(id => requestBody.put("signedInId", id))
+      val json = mapper.writeValueAsString(requestBody)
       val request = HttpRequest.newBuilder()
         .uri(URI.create(s"$normalizedUrl/conversations/${encode(conversationId)}"))
-        .POST(HttpRequest.BodyPublishers.noBody())
+        .POST(HttpRequest.BodyPublishers.ofString(json))
+        .header("Content-Type", "application/json")
         .build()
       val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
       val statusCode = response.statusCode()
@@ -66,10 +71,11 @@ class HttpChatBackend(baseUrl: String) extends ChatBackend with ImageModelAccess
     }
   }
 
-  override def getConversationHistory(conversationId: String): List[ConversationMessage] = {
+  override def getConversationHistory(userContext: UserContext, conversationId: String): List[ConversationMessage] = {
     try {
+      val uri = s"$normalizedUrl/conversations/${encode(conversationId)}?isPremium=${encode(userContext.isPremium)}&deviceId=${encode(userContext.deviceId)}${userContext.signedInId.map(id => s"&signedInId=${encode(id)}").getOrElse("")}"
       val request = HttpRequest.newBuilder()
-        .uri(URI.create(s"$normalizedUrl/conversations/${encode(conversationId)}"))
+        .uri(URI.create(uri))
         .GET()
         .build()
       val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
@@ -84,7 +90,7 @@ class HttpChatBackend(baseUrl: String) extends ChatBackend with ImageModelAccess
         val text = m.get("text").asInstanceOf[String]
         val id = m.get("id").asInstanceOf[String]
         val archived = java.lang.Boolean.TRUE == m.get("archived")
-        val createdAt = Instant.parse(m.get("createdAt").asInstanceOf[String])
+        val createdAt = valueAsLong(m.get("createdAt"))
 
         val chatMsg: dev.langchain4j.data.message.ChatMessage = msgType match {
           case "ai"     => dev.langchain4j.data.message.AiMessage.from(text)
@@ -102,20 +108,52 @@ class HttpChatBackend(baseUrl: String) extends ChatBackend with ImageModelAccess
     }
   }
 
-  override def listConversations(): List[String] = {
+  override def listConversations(userContext: UserContext): List[Conversation] = {
     try {
+      val uri = s"$normalizedUrl/conversations?isPremium=${encode(userContext.isPremium)}&deviceId=${encode(userContext.deviceId)}${userContext.signedInId.map(id => s"&signedInId=${encode(id)}").getOrElse("")}"
       val request = HttpRequest.newBuilder()
-        .uri(URI.create(s"$normalizedUrl/conversations"))
+        .uri(URI.create(uri))
         .GET()
         .build()
       val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
       val body = mapper.readValue(response.body(), classOf[java.util.Map[_, _]])
       val conversations = body.get("conversations").asInstanceOf[java.util.List[_]]
       if (conversations == null) return Nil
-      conversations.asScala.map(_.toString).toList
+      conversations.asScala.map { value =>
+        val conversation = value.asInstanceOf[java.util.Map[_, _]]
+        Conversation(
+          id = conversation.get("id").asInstanceOf[String],
+          title = conversation.get("title").asInstanceOf[String],
+          createdAt = valueAsLong(conversation.get("createdAt"))
+        )
+      }.toList
     } catch {
       case e: Exception =>
         throw operationFailure("list conversations", e)
+    }
+  }
+
+  override def setConversationTitle(userContext: UserContext, conversationId: String, title: String): Unit = {
+    try {
+      val requestBody = new java.util.LinkedHashMap[String, AnyRef]()
+      requestBody.put("title", title)
+      requestBody.put("isPremium", userContext.isPremium)
+      requestBody.put("deviceId", userContext.deviceId)
+      userContext.signedInId.foreach(id => requestBody.put("signedInId", id))
+      val json = mapper.writeValueAsString(requestBody)
+      val request = HttpRequest.newBuilder()
+        .uri(URI.create(s"$normalizedUrl/conversations/${encode(conversationId)}/title"))
+        .PUT(HttpRequest.BodyPublishers.ofString(json))
+        .header("Content-Type", "application/json")
+        .build()
+      val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
+      if (response.statusCode() >= 400) {
+        val backendError = safeBackendError(response.body())
+        throw new RuntimeException(s"HTTP ${response.statusCode()}${if (backendError == null) "" else s": $backendError"}")
+      }
+    } catch {
+      case e: Exception =>
+        throw operationFailure("set conversation title", e)
     }
   }
 
@@ -153,14 +191,16 @@ class HttpChatBackend(baseUrl: String) extends ChatBackend with ImageModelAccess
     message: String,
     attachments: List[MessageAttachment],
     modelIndex: Int,
-    isPremium: Boolean,
+    userContext: UserContext,
     streamHandler: ChatStreamHandler
   ): ChatResult = {
     try {
       val requestBody = new java.util.LinkedHashMap[String, AnyRef]()
       requestBody.put("message", message)
       requestBody.put("modelIndex", Int.box(modelIndex))
-      requestBody.put("isPremium", java.lang.Boolean.valueOf(isPremium))
+      requestBody.put("isPremium", userContext.isPremium)
+      requestBody.put("deviceId", userContext.deviceId)
+      userContext.signedInId.foreach(id => requestBody.put("signedInId", id))
       if (attachments.nonEmpty) {
         requestBody.put("attachments", attachments.map(serializeAttachment).asJava)
       }
@@ -214,10 +254,11 @@ class HttpChatBackend(baseUrl: String) extends ChatBackend with ImageModelAccess
     }
   }
 
-  override def clearConversation(conversationId: String): Unit = {
+  override def clearConversation(userContext: UserContext, conversationId: String): Unit = {
     try {
+      val uri = s"$normalizedUrl/conversations/${encode(conversationId)}?isPremium=${encode(userContext.isPremium)}&deviceId=${encode(userContext.deviceId)}${userContext.signedInId.map(id => s"&signedInId=${encode(id)}").getOrElse("")}"
       val request = HttpRequest.newBuilder()
-        .uri(URI.create(s"$normalizedUrl/conversations/${encode(conversationId)}"))
+        .uri(URI.create(uri))
         .DELETE()
         .build()
       httpClient.send(request, HttpResponse.BodyHandlers.ofString())
@@ -278,6 +319,23 @@ class HttpChatBackend(baseUrl: String) extends ChatBackend with ImageModelAccess
       if (error == null) null else error.toString
     } catch {
       case _: Exception => body.trim
+    }
+  }
+
+  private def valueAsLong(value: Any): Long = {
+    if (value == null) {
+      0L
+    } else {
+      value match {
+        case n: java.lang.Number => n.longValue()
+        case s: String =>
+          try {
+            java.lang.Long.parseLong(s)
+          } catch {
+            case _: NumberFormatException => 0L
+          }
+        case _ => 0L
+      }
     }
   }
 

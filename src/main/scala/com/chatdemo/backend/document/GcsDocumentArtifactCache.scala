@@ -1,15 +1,13 @@
 package com.chatdemo.backend.document
 
+import com.chatdemo.backend.config.FirebaseInitializer
 import com.chatdemo.common.document.DocumentArtifacts
 import com.fasterxml.jackson.core.`type`.TypeReference
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.google.auth.oauth2.GoogleCredentials
-import com.google.cloud.storage.{BlobId, BlobInfo, Storage, StorageOptions}
+import com.google.cloud.storage.{BlobId, BlobInfo}
 
-import java.io.{FileInputStream, IOException}
 import java.net.URI
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path}
 import java.security.MessageDigest
 import java.util.{HexFormat, Locale, List => JList}
 import scala.jdk.CollectionConverters.*
@@ -18,29 +16,32 @@ import scala.jdk.CollectionConverters.*
  * Stores parsed document artifacts in GCS without a DB.
  */
 class GcsDocumentArtifactCache(
-  serviceAccountPathStr: String,
-  configuredBucket: String,
+  firebase: FirebaseInitializer,
   namespace: String = "global"
 ) extends DocumentArtifactCache {
 
   private val CachePrefix = "doc_cache"
-  private val serviceAccountPath: Path = Path.of(serviceAccountPathStr)
   private val resolvedNamespace: String = if (namespace == null || namespace.isBlank) "global" else namespace
   private val objectMapper = new ObjectMapper()
-  @volatile private var storage: Storage = _
 
-  def isConfigured: Boolean = Files.exists(serviceAccountPath)
+  def this(serviceAccountPathStr: String, configuredBucket: String) =
+    this(new FirebaseInitializer(serviceAccountPathStr, configuredBucket), "global")
+
+  def this(serviceAccountPathStr: String, configuredBucket: String, namespace: String) =
+    this(new FirebaseInitializer(serviceAccountPathStr, configuredBucket), namespace)
+
+  def isConfigured: Boolean = firebase.isConfigured
 
   override def load(sourceUrl: String): Option[DocumentArtifacts] = {
     if (!isConfigured) {
       return None
     }
     try {
-      val client = getStorageClient()
-      val bucket = resolveBucketName()
+      val bucket = firebase.resolvedBucketName
       if (bucket == null || bucket.isBlank) {
         return None
       }
+      val client = firebase.storage
       val objectPath = objectPathFor(sourceUrl)
       val blob = client.get(BlobId.of(bucket, objectPath))
       if (blob == null || !blob.exists()) {
@@ -59,11 +60,11 @@ class GcsDocumentArtifactCache(
       return
     }
     try {
-      val client = getStorageClient()
-      val bucket = resolveBucketName()
+      val bucket = firebase.resolvedBucketName
       if (bucket == null || bucket.isBlank) {
         return
       }
+      val client = firebase.storage
       val objectPath = objectPathFor(sourceUrl)
       val javaChunks: JList[String] = artifacts.chunks.asJava
       val content = objectMapper.writeValueAsBytes(javaChunks)
@@ -126,44 +127,5 @@ class GcsDocumentArtifactCache(
     val digest = MessageDigest.getInstance("SHA-256")
     val hash = digest.digest(input.getBytes(StandardCharsets.UTF_8))
     HexFormat.of().formatHex(hash)
-  }
-
-  private def getStorageClient(): Storage = {
-    var current = storage
-    if (current != null) {
-      return current
-    }
-    this.synchronized {
-      if (storage != null) {
-        return storage
-      }
-      val inputStream = new FileInputStream(serviceAccountPath.toFile)
-      try {
-        val credentials = GoogleCredentials.fromStream(inputStream)
-        storage = StorageOptions.newBuilder()
-          .setCredentials(credentials)
-          .build()
-          .getService
-        storage
-      } finally {
-        inputStream.close()
-      }
-    }
-  }
-
-  private def resolveBucketName(): String = {
-    if (configuredBucket != null && !configuredBucket.isBlank) {
-      return configuredBucket
-    }
-    try {
-      val root = objectMapper.readTree(serviceAccountPath.toFile)
-      val projectId = root.get("project_id")
-      if (projectId != null && !projectId.asText().isBlank) {
-        return projectId.asText() + ".appspot.com"
-      }
-    } catch {
-      case _: IOException => return null
-    }
-    null
   }
 }

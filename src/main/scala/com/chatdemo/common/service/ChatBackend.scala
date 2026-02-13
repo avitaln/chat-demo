@@ -1,7 +1,7 @@
 package com.chatdemo.common.service
 
 import com.chatdemo.common.config.ProviderConfig
-import com.chatdemo.common.model.{ConversationMessage, MessageAttachment}
+import com.chatdemo.common.model.{Conversation, ConversationMessage, MessageAttachment, UserContext}
 
 /**
  * Contract between the client application and the backend.
@@ -15,13 +15,16 @@ trait ChatBackend {
   // ---- Conversation management ----
 
   /** Create a new conversation. Returns true if created, false if it already existed. */
-  def createConversation(conversationId: String): Boolean
+  def createConversation(userContext: UserContext, conversationId: String): Boolean
 
   /** Get full message history for a conversation. */
-  def getConversationHistory(conversationId: String): List[ConversationMessage]
+  def getConversationHistory(userContext: UserContext, conversationId: String): List[ConversationMessage]
 
-  /** List all known conversation IDs. */
-  def listConversations(): List[String]
+  /** List all known conversations for the given user. */
+  def listConversations(userContext: UserContext): List[Conversation]
+
+  /** Set or update a conversation title. */
+  def setConversationTitle(userContext: UserContext, conversationId: String, title: String): Unit
 
   // ---- Model management (read-only) ----
 
@@ -37,7 +40,7 @@ trait ChatBackend {
    * @param message        the user's message text
    * @param attachments    attachments for this turn (images as links, documents, etc.)
    * @param modelIndex     index into getAvailableModels for the model to use
-   * @param isPremium      whether the user has premium entitlement for gated features
+   * @param userContext    user context containing premium status and identity
    * @param streamHandler  callback that receives streaming tokens
    */
   def chat(
@@ -45,9 +48,9 @@ trait ChatBackend {
     message: String,
     attachments: List[MessageAttachment],
     modelIndex: Int,
-    isPremium: Boolean,
+    userContext: UserContext,
     streamHandler: ChatStreamHandler
   ): ChatResult
 
-  def clearConversation(conversationId: String): Unit
+  def clearConversation(userContext: UserContext, conversationId: String): Unit
 }

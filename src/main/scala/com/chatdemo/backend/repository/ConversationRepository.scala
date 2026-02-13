@@ -1,6 +1,6 @@
 package com.chatdemo.backend.repository
 
-import com.chatdemo.common.model.{ConversationMessage, MessageAttachment}
+import com.chatdemo.common.model.{Conversation, ConversationMessage, MessageAttachment, UserContext}
 import dev.langchain4j.data.message.ChatMessage
 
 /**
@@ -9,36 +9,36 @@ import dev.langchain4j.data.message.ChatMessage
  */
 trait ConversationRepository {
 
-  /** Create a new conversation with the given ID. Returns true if created, false if it already exists. */
-  def createConversation(conversationId: String): Boolean
+  /** Create a new conversation with the given ID, scoped to the user. Returns true if created, false if it already exists. */
+  def createConversation(userContext: UserContext, conversationId: String): Boolean
 
-  /** Check whether a conversation exists. */
-  def conversationExists(conversationId: String): Boolean
+  /** List all conversations for the given user. */
+  def listConversations(userContext: UserContext): List[Conversation]
 
-  /** List all conversation IDs. */
-  def listConversationIds(): List[String]
+  /** Set or update conversation title for the given user and conversation. */
+  def setConversationTitle(userContext: UserContext, conversationId: String, title: String): Unit
 
   /** Get full conversation history including archived messages. Used for displaying to the user. */
-  def getFullHistory(conversationId: String): List[ConversationMessage]
+  def getFullHistory(userContext: UserContext, conversationId: String): List[ConversationMessage]
 
   /** Get only active (non-archived) messages for the LLM. */
-  def getActiveMessages(conversationId: String): List[dev.langchain4j.data.message.ChatMessage]
+  def getActiveMessages(userContext: UserContext, conversationId: String): List[dev.langchain4j.data.message.ChatMessage]
 
   /** Get the current summary of archived messages. */
-  def getSummary(conversationId: String): String
+  def getSummary(userContext: UserContext, conversationId: String): String
 
   /** Add a new message to the conversation. */
-  def addMessage(conversationId: String, message: dev.langchain4j.data.message.ChatMessage): Unit
+  def addMessage(userContext: UserContext, conversationId: String, message: dev.langchain4j.data.message.ChatMessage): Unit
 
   /** Attach metadata to the latest AI message in the conversation. */
-  def attachToLatestAiMessage(conversationId: String, attachments: List[MessageAttachment]): Unit = {}
+  def attachToLatestAiMessage(userContext: UserContext, conversationId: String, attachments: List[MessageAttachment]): Unit = {}
 
   /** Attach metadata to the latest User message in the conversation. */
-  def attachToLatestUserMessage(conversationId: String, attachments: List[MessageAttachment]): Unit = {}
+  def attachToLatestUserMessage(userContext: UserContext, conversationId: String, attachments: List[MessageAttachment]): Unit = {}
 
   /** Archive messages that have been summarized. */
-  def archiveMessages(conversationId: String, messageIds: List[String], newSummary: String): Unit
+  def archiveMessages(userContext: UserContext, conversationId: String, messageIds: List[String], newSummary: String): Unit
 
   /** Clear all messages and summary for a conversation. */
-  def clear(conversationId: String): Unit
+  def clear(userContext: UserContext, conversationId: String): Unit
 }

@@ -1,15 +1,15 @@
 package com.chatdemo.backend
 
-import com.chatdemo.backend.config.{FirebaseConfig, ModelsConfig}
+import com.chatdemo.backend.config.{FirebaseConfig, FirebaseInitializer, ModelsConfig}
 import com.chatdemo.backend.document.{DocumentArtifactCache, DocumentContextService, GcsDocumentArtifactCache, NoopDocumentArtifactCache}
 import com.chatdemo.backend.logging.LlmExchangeLogger
 import com.chatdemo.backend.memory.{HistoryAwareChatMemoryStore, SummarizingTokenWindowChatMemory}
 import com.chatdemo.backend.model.ModelFactory
-import com.chatdemo.backend.repository.{ConversationRepository, SqliteConversationRepository}
+import com.chatdemo.backend.repository.{ConversationRepository, FirestoreConversationRepository}
 import com.chatdemo.backend.storage.FirebaseStorageUploader
 import com.chatdemo.backend.tools.{GeminiImageGenerationTool, GrokImageGenerationTool, ImageGenerationTool, OpenAiImageGenerationTool, QwenImageGenerationTool}
 import com.chatdemo.common.config.ProviderConfig
-import com.chatdemo.common.model.{ConversationMessage, MessageAttachment, MessageAttachmentExtractor}
+import com.chatdemo.common.model.{Conversation, ConversationMessage, MessageAttachment, MessageAttachmentExtractor, UserContext}
 import com.chatdemo.common.service.{ChatBackend, ChatResult, ChatStreamHandler, ExposedImageModel, ImageModelAccessPolicy}
 import dev.langchain4j.data.message.{AiMessage, ChatMessage, ImageContent, TextContent, UserMessage}
 import dev.langchain4j.memory.chat.ChatMemoryProvider
@@ -45,10 +45,13 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
 
   // --- Immutable / shared infrastructure (safe across requests) ---
   private val configs: List[ProviderConfig] = ModelsConfig.Providers
-  private val conversationRepository: ConversationRepository = new SqliteConversationRepository(
-    sys.env.getOrElse("CHAT_DB_PATH", "chat-demo.db")
+  private val firebaseInitializer: FirebaseInitializer = new FirebaseInitializer(
+    FirebaseConfig.getServiceAccountPath,
+    FirebaseConfig.getStorageBucket
   )
-  private val memoryStore = new HistoryAwareChatMemoryStore(conversationRepository)
+  private val conversationRepository: ConversationRepository = new FirestoreConversationRepository(
+    firebaseInitializer
+  )
   private val tokenCountEstimator: TokenCountEstimator = new OpenAiTokenCountEstimator("gpt-4")
   private val documentContextService: DocumentContextService = createDocumentContextService()
   private val llmExchangeLogger = new LlmExchangeLogger(Path.of("logs", "llm-exchanges.log"))
@@ -95,16 +98,20 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
   // Conversation management
   // ----------------------------------------------------------------
 
-  override def createConversation(conversationId: String): Boolean = {
-    conversationRepository.createConversation(conversationId)
+  override def createConversation(userContext: UserContext, conversationId: String): Boolean = {
+    conversationRepository.createConversation(userContext, conversationId)
   }
 
-  override def getConversationHistory(conversationId: String): List[ConversationMessage] = {
-    conversationRepository.getFullHistory(conversationId)
+  override def getConversationHistory(userContext: UserContext, conversationId: String): List[ConversationMessage] = {
+    conversationRepository.getFullHistory(userContext, conversationId)
   }
 
-  override def listConversations(): List[String] = {
-    conversationRepository.listConversationIds()
+  override def listConversations(userContext: UserContext): List[Conversation] = {
+    conversationRepository.listConversations(userContext)
+  }
+
+  override def setConversationTitle(userContext: UserContext, conversationId: String, title: String): Unit = {
+    conversationRepository.setConversationTitle(userContext, conversationId, title)
   }
 
   // ----------------------------------------------------------------
@@ -122,23 +129,40 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     message: String,
     attachments: List[MessageAttachment],
     modelIndex: Int,
-    isPremium: Boolean,
+    userContext: UserContext,
     streamHandler: ChatStreamHandler
   ): ChatResult = {
-    conversationRepository.createConversation(conversationId)
+    val requestStartedAt = System.nanoTime()
+    def traceStep[T](step: String)(block: => T): T = timed("chat/" + step, conversationId, userContext)(block)
+
+    traceStep("createConversation") {
+      conversationRepository.createConversation(userContext, conversationId)
+    }
+    val isPremium = userContext.isPremium.toBoolean
 
     val safeModelIndex = if (modelIndex >= 0 && modelIndex < configs.size) modelIndex else 0
     val currentConfig = configs(safeModelIndex)
     val providerName = currentConfig.getDisplayName.split(" ")(0)
     val modelName = currentConfig.model
-    val promptImageIntent = classifyPromptImageIntent(currentConfig, message)
+    val promptImageIntent = traceStep("classifyPromptImageIntent") {
+      classifyPromptImageIntent(currentConfig, message)
+    }
 
-    val systemPrompt = getSystemPromptForRequest(conversationId, message)
-    val messageForModel = enrichMessageForModel(conversationId, message, attachments, promptImageIntent)
-    val effectivePayload = buildEffectivePayload(conversationId, systemPrompt, messageForModel)
+    val systemPrompt = traceStep("buildSystemPrompt") {
+      getSystemPromptForRequest(conversationId, message)
+    }
+    lazy val requestHistory = traceStep("loadHistoryForEnrichment") {
+      conversationRepository.getFullHistory(userContext, conversationId)
+    }
+    val messageForModel = traceStep("enrichMessageForModel") {
+      enrichMessageForModel(userContext, conversationId, message, attachments, promptImageIntent, requestHistory)
+    }
+    val effectivePayload = traceStep("buildEffectivePayload") {
+      buildEffectivePayload(userContext, conversationId, systemPrompt, messageForModel)
+    }
 
     if (shouldUseDirectVisionAnswer(currentConfig, message, attachments)) {
-      tryDirectVisionAnswer(conversationId, message, attachments, safeModelIndex, streamHandler, providerName, modelName) match {
+      tryDirectVisionAnswer(userContext, conversationId, message, attachments, safeModelIndex, streamHandler, providerName, modelName) match {
         case Some(result) =>
           llmExchangeLogger.logExchange(
             providerName, modelName, message, "[multimodal] " + message,
@@ -150,15 +174,21 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
       }
     }
 
-    val imageToolSession = createImageToolSession(isPremium, currentConfig)
-    val assistant = createAssistant(currentConfig, imageToolSession)
+    val imageToolSession = createImageToolSession(
+      isPremium = isPremium,
+      config = currentConfig,
+      onImageGenerationStarted = () => streamHandler.onToken("generating your image...")
+    )
+    val assistant = createAssistant(currentConfig, imageToolSession, userContext)
 
     val done = new CountDownLatch(1)
     val responseBuffer = new StringBuilder()
     val errorHolder = new Array[String](1)
 
     try {
-      val stream = assistant.chat(conversationId, systemPrompt, messageForModel)
+      val stream = traceStep("assistant.chat") {
+        assistant.chat(conversationId, systemPrompt, messageForModel)
+      }
       stream.onPartialResponse(token => {
         responseBuffer.append(token)
         streamHandler.onToken(token)
@@ -168,24 +198,32 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
         errorHolder(0) = error.getMessage
         done.countDown()
       }).start()
-      done.await()
+      traceStep("streamAwait") {
+        done.await()
+      }
 
       // Persist user attachments
       if (attachments.nonEmpty) {
-        conversationRepository.attachToLatestUserMessage(conversationId, attachments)
+        traceStep("attachToLatestUserMessage") {
+          conversationRepository.attachToLatestUserMessage(userContext, conversationId, attachments)
+        }
       }
-      val toolAttachments = consumeToolAttachments(conversationId, imageToolSession)
+      val toolAttachments = traceStep("consumeToolAttachments") {
+        consumeToolAttachments(userContext, conversationId, imageToolSession)
+      }
       var latestAttachments =
         if (toolAttachments.nonEmpty) toolAttachments
-        else getLatestAiAttachments(conversationId)
+        else traceStep("getLatestAiAttachments") {
+          getLatestAiAttachments(userContext, conversationId)
+        }
       val initialResponseText = responseBuffer.toString()
       if (shouldAttemptDirectImageToolFallback(message, initialResponseText, latestAttachments, errorHolder(0), imageToolSession, promptImageIntent)) {
-        val fallbackText = runDirectImageToolFallback(conversationId, message, messageForModel, attachments, imageToolSession, promptImageIntent)
+        val fallbackText = runDirectImageToolFallback(userContext, conversationId, message, messageForModel, attachments, imageToolSession, promptImageIntent)
         if (fallbackText != null && !fallbackText.isBlank) {
           val separator = if (responseBuffer.isEmpty) "" else "\n"
           streamHandler.onToken(separator + fallbackText)
           responseBuffer.append(separator).append(fallbackText)
-          val fallbackAttachments = consumeToolAttachments(conversationId, imageToolSession)
+          val fallbackAttachments = consumeToolAttachments(userContext, conversationId, imageToolSession)
           if (fallbackAttachments.nonEmpty) {
             latestAttachments = fallbackAttachments
           }
@@ -204,7 +242,7 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
         llmExchangeLogger.logExchange(
           providerName, modelName, message, messageForModel,
           effectivePayload, responseBuffer.toString(),
-          getLatestAiAttachments(conversationId), error
+          getLatestAiAttachments(userContext, conversationId), error
         )
         ChatResult(Nil, error)
       case e: Exception =>
@@ -212,14 +250,18 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
         llmExchangeLogger.logExchange(
           providerName, modelName, message, messageForModel,
           effectivePayload, responseBuffer.toString(),
-          getLatestAiAttachments(conversationId), error
+          getLatestAiAttachments(userContext, conversationId), error
         )
         ChatResult(Nil, error)
     }
+    finally {
+      val elapsedMs = (System.nanoTime() - requestStartedAt) / 1000000L
+      println(s"[perf] chat/total conversationId=$conversationId user=${userContext.effectiveId} took ${elapsedMs}ms")
+    }
   }
 
-  override def clearConversation(conversationId: String): Unit = {
-    conversationRepository.clear(conversationId)
+  override def clearConversation(userContext: UserContext, conversationId: String): Unit = {
+    conversationRepository.clear(userContext, conversationId)
   }
 
   def getLogPath: String = llmExchangeLogger.getLogPath.toAbsolutePath.toString
@@ -228,9 +270,10 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
   // Internal wiring (per-request assistant creation)
   // ----------------------------------------------------------------
 
-  private def createAssistant(config: ProviderConfig, imageToolSession: ImageToolSession): Assistant = {
+  private def createAssistant(config: ProviderConfig, imageToolSession: ImageToolSession, userContext: UserContext): Assistant = {
     val model: ChatModel = ModelFactory.createModel(config)
     val streamingModel: StreamingChatModel = ModelFactory.createStreamingModel(config)
+    val memoryStore = memoryStoreFor(userContext)
 
     val memoryProvider: ChatMemoryProvider = (memoryId: AnyRef) => {
       SummarizingTokenWindowChatMemory.builder()
@@ -249,7 +292,11 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     builder.build()
   }
 
-  private def createImageToolSession(isPremium: Boolean, config: ProviderConfig): ImageToolSession = {
+  private def createImageToolSession(
+    isPremium: Boolean,
+    config: ProviderConfig,
+    onImageGenerationStarted: () => Unit
+  ): ImageToolSession = {
     if ("claude".equalsIgnoreCase(config.providerType)) {
       return ImageToolSession(None, None, new ImageGenerationTool.AttachmentCollector())
     }
@@ -264,21 +311,24 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
               openAiImageModel = imageToolDependencies.openAiImageModel,
               openAiModelName = defaultOpenAiImageModel,
               firebaseStorageUploader = firebaseStorageUploader,
-              attachmentCollector = attachmentCollector
+              attachmentCollector = attachmentCollector,
+              onGenerationStarted = onImageGenerationStarted
             )
           case ImageGenerationTool.Provider.GEMINI =>
             new GeminiImageGenerationTool(
               geminiImageModel = imageToolDependencies.geminiImageModel,
               geminiModelName = defaultGeminiImageModel,
               firebaseStorageUploader = firebaseStorageUploader,
-              attachmentCollector = attachmentCollector
+              attachmentCollector = attachmentCollector,
+              onGenerationStarted = onImageGenerationStarted
             )
           case ImageGenerationTool.Provider.GROK =>
             new GrokImageGenerationTool(
               grokImageModel = imageToolDependencies.grokImageModel,
               grokModelName = defaultGrokImageModel,
               firebaseStorageUploader = firebaseStorageUploader,
-              attachmentCollector = attachmentCollector
+              attachmentCollector = attachmentCollector,
+              onGenerationStarted = onImageGenerationStarted
             )
           case ImageGenerationTool.Provider.QWEN =>
             new QwenImageGenerationTool(
@@ -287,7 +337,8 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
               qwenEditModelName = defaultQwenEditImageModel,
               qwenApiBaseUrl = ModelFactory.qwenApiBaseUrl,
               firebaseStorageUploader = firebaseStorageUploader,
-              attachmentCollector = attachmentCollector
+              attachmentCollector = attachmentCollector,
+              onGenerationStarted = onImageGenerationStarted
             )
         }
         ImageToolSession(Some(new ImageGenerationTool.ExposedTool(tool)), Some(tool), attachmentCollector)
@@ -345,18 +396,12 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
   }
 
   private def createFirebaseStorageUploader(): FirebaseStorageUploader = {
-    val uploader = new FirebaseStorageUploader(
-      FirebaseConfig.getServiceAccountPath,
-      FirebaseConfig.getStorageBucket
-    )
+    val uploader = new FirebaseStorageUploader(firebaseInitializer)
     uploader
   }
 
   private def createDocumentContextService(): DocumentContextService = {
-    val gcsCache = new GcsDocumentArtifactCache(
-      FirebaseConfig.getServiceAccountPath,
-      FirebaseConfig.getStorageBucket
-    )
+    val gcsCache = new GcsDocumentArtifactCache(firebaseInitializer)
     val cache: DocumentArtifactCache = if (gcsCache.isConfigured) gcsCache else new NoopDocumentArtifactCache()
     new DocumentContextService(cache)
   }
@@ -366,25 +411,29 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
   // ----------------------------------------------------------------
 
   private def enrichMessageForModel(
+    userContext: UserContext,
     conversationId: String,
     message: String,
     attachments: List[MessageAttachment],
-    promptImageIntent: PromptImageIntent
+    promptImageIntent: PromptImageIntent,
+    conversationHistory: List[ConversationMessage]
   ): String = {
-    val enriched = enrichMessageWithLatestImageAttachment(conversationId, message, attachments, promptImageIntent)
-    enrichMessageWithLatestDocumentContext(conversationId, enriched, message, attachments)
+    val enriched = enrichMessageWithLatestImageAttachment(userContext, conversationId, message, attachments, promptImageIntent, conversationHistory)
+    enrichMessageWithLatestDocumentContext(userContext, conversationId, enriched, message, attachments, conversationHistory)
   }
 
   private def enrichMessageWithLatestImageAttachment(
+    userContext: UserContext,
     conversationId: String,
     message: String,
     attachments: List[MessageAttachment],
-    promptImageIntent: PromptImageIntent
+    promptImageIntent: PromptImageIntent,
+    conversationHistory: List[ConversationMessage]
   ): String = {
     if (extractFirstUrl(message) != null) {
       return message
     }
-    val latestImageUrl = findLatestImageAttachmentUrl(conversationId, attachments)
+    val latestImageUrl = findLatestImageAttachmentUrl(userContext, conversationId, attachments, conversationHistory)
     if (latestImageUrl == null) {
       return message
     }
@@ -404,12 +453,14 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
   }
 
   private def enrichMessageWithLatestDocumentContext(
+    userContext: UserContext,
     conversationId: String,
     messageForModel: String,
     originalMessage: String,
-    attachments: List[MessageAttachment]
+    attachments: List[MessageAttachment],
+    conversationHistory: List[ConversationMessage]
   ): String = {
-    val documentUrl = findLatestDocumentAttachmentUrl(conversationId, originalMessage, attachments)
+    val documentUrl = findLatestDocumentAttachmentUrl(userContext, conversationId, originalMessage, attachments, conversationHistory)
     if (documentUrl == null) {
       return messageForModel
     }
@@ -426,12 +477,17 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     }
   }
 
-  private def findLatestImageAttachmentUrl(conversationId: String, attachments: List[MessageAttachment]): String = {
+  private def findLatestImageAttachmentUrl(
+    userContext: UserContext,
+    conversationId: String,
+    attachments: List[MessageAttachment],
+    conversationHistory: List[ConversationMessage]
+  ): String = {
     val pendingImage = findLatestAttachmentByType(attachments, "image")
     if (pendingImage != null && pendingImage.url != null && !pendingImage.url.isBlank) {
       return pendingImage.url
     }
-    val history = conversationRepository.getFullHistory(conversationId)
+    val history = conversationHistory
     var i = history.size - 1
     while (i >= 0) {
       val message = history(i)
@@ -451,7 +507,13 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     null
   }
 
-  private def findLatestDocumentAttachmentUrl(conversationId: String, currentMessage: String, attachments: List[MessageAttachment]): String = {
+  private def findLatestDocumentAttachmentUrl(
+    userContext: UserContext,
+    conversationId: String,
+    currentMessage: String,
+    attachments: List[MessageAttachment],
+    conversationHistory: List[ConversationMessage]
+  ): String = {
     val pendingDoc = findLatestAttachmentByType(attachments, "document")
     if (pendingDoc != null && pendingDoc.url != null && !pendingDoc.url.isBlank) {
       return pendingDoc.url
@@ -461,7 +523,7 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     if (currentDoc != null && currentDoc.url != null && !currentDoc.url.isBlank) {
       return currentDoc.url
     }
-    val history = conversationRepository.getFullHistory(conversationId)
+    val history = conversationHistory
     var i = history.size - 1
     while (i >= 0) {
       val msg = history(i)
@@ -493,7 +555,11 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     findLatestAttachmentByType(attachments, attachmentType) != null
   }
 
-  private def consumeToolAttachments(conversationId: String, imageToolSession: ImageToolSession): List[MessageAttachment] = {
+  private def consumeToolAttachments(
+    userContext: UserContext,
+    conversationId: String,
+    imageToolSession: ImageToolSession
+  ): List[MessageAttachment] = {
     if (!imageToolSession.includeImageTools) {
       return Nil
     }
@@ -501,18 +567,18 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     if (toolAttachments.isEmpty) {
       return Nil
     }
-    conversationRepository.attachToLatestAiMessage(conversationId, toolAttachments)
-    val persistedOnAi = getLatestAiAttachments(conversationId).exists { existing =>
+    conversationRepository.attachToLatestAiMessage(userContext, conversationId, toolAttachments)
+    val persistedOnAi = getLatestAiAttachments(userContext, conversationId).exists { existing =>
       existing != null && toolAttachments.exists(a => a != null && a.url == existing.url)
     }
     if (!persistedOnAi) {
-      conversationRepository.attachToLatestUserMessage(conversationId, toolAttachments)
+      conversationRepository.attachToLatestUserMessage(userContext, conversationId, toolAttachments)
     }
     toolAttachments
   }
 
-  private def getLatestAiAttachments(conversationId: String): List[MessageAttachment] = {
-    val history = conversationRepository.getFullHistory(conversationId)
+  private def getLatestAiAttachments(userContext: UserContext, conversationId: String): List[MessageAttachment] = {
+    val history = conversationRepository.getFullHistory(userContext, conversationId)
     if (history.isEmpty) {
       return Nil
     }
@@ -527,7 +593,13 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
   // Payload building and utilities
   // ----------------------------------------------------------------
 
-  private def buildEffectivePayload(conversationId: String, systemPrompt: String, currentUserMessage: String): List[String] = {
+  private def buildEffectivePayload(
+    userContext: UserContext,
+    conversationId: String,
+    systemPrompt: String,
+    currentUserMessage: String
+  ): List[String] = {
+    val memoryStore = memoryStoreFor(userContext)
     val payload = ArrayBuffer.empty[String]
     if (systemPrompt != null && !systemPrompt.isBlank) {
       payload.append("[system] " + safeMessage(systemPrompt))
@@ -585,6 +657,7 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
   }
 
   private def tryDirectVisionAnswer(
+    userContext: UserContext,
     conversationId: String,
     message: String,
     attachments: List[MessageAttachment],
@@ -608,11 +681,11 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
       val response: ChatResponse = ModelFactory.createModel(configs(modelIndex)).chat(userMessage)
       val aiText = Option(response.aiMessage()).map(_.text()).getOrElse("")
 
-      conversationRepository.addMessage(conversationId, UserMessage.from(message))
+      conversationRepository.addMessage(userContext, conversationId, UserMessage.from(message))
       if (attachments.nonEmpty) {
-        conversationRepository.attachToLatestUserMessage(conversationId, attachments)
+        conversationRepository.attachToLatestUserMessage(userContext, conversationId, attachments)
       }
-      conversationRepository.addMessage(conversationId, AiMessage.from(aiText))
+      conversationRepository.addMessage(userContext, conversationId, AiMessage.from(aiText))
 
       streamHandler.onToken(aiText)
       Some(ChatResult(Nil, null))
@@ -708,6 +781,7 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
   }
 
   private def runDirectImageToolFallback(
+    userContext: UserContext,
     conversationId: String,
     message: String,
     messageForModel: String,
@@ -719,7 +793,12 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     if (tool == null) {
       return null
     }
-    val latestImageUrl = findLatestImageAttachmentUrl(conversationId, attachments)
+    val latestImageUrl = findLatestImageAttachmentUrl(
+      userContext,
+      conversationId,
+      attachments,
+      conversationRepository.getFullHistory(userContext, conversationId)
+    )
     val shouldUseEdit = promptImageIntent == PromptImageIntent.EDIT_EXISTING && latestImageUrl != null && !latestImageUrl.isBlank
     if (shouldUseEdit) {
       tool.editImage(latestImageUrl, message)
@@ -741,6 +820,10 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     } catch {
       case _: Exception => PromptImageIntent.UNKNOWN
     }
+  }
+
+  private def memoryStoreFor(userContext: UserContext): HistoryAwareChatMemoryStore = {
+    new HistoryAwareChatMemoryStore(conversationRepository, userContext)
   }
 
   private def normalizeIntentLabel(raw: String): PromptImageIntent = {
@@ -834,5 +917,15 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
     attachmentCollector: ImageGenerationTool.AttachmentCollector
   ) {
     def includeImageTools: Boolean = tool.isDefined
+  }
+
+  private def timed[T](label: String, conversationId: String, userContext: UserContext)(block: => T): T = {
+    val startedAt = System.nanoTime()
+    try {
+      block
+    } finally {
+      val elapsedMs = (System.nanoTime() - startedAt) / 1000000L
+      println(s"[perf] $label conversationId=$conversationId user=${userContext.effectiveId} took ${elapsedMs}ms")
+    }
   }
 }

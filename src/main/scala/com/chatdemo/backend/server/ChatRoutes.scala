@@ -1,7 +1,7 @@
 package com.chatdemo.backend.server
 
 import com.chatdemo.common.config.ProviderConfig
-import com.chatdemo.common.model.{ConversationMessage, MessageAttachment}
+import com.chatdemo.common.model.{Conversation, ConversationMessage, MessageAttachment, UserContext}
 import com.chatdemo.common.service.{ChatBackend, ChatResult, ChatStreamHandler}
 import com.fasterxml.jackson.databind.ObjectMapper
 import io.undertow.server.{HttpHandler, HttpServerExchange, RoutingHandler}
@@ -27,6 +27,7 @@ class ChatRoutes(private val backend: ChatBackend) {
       .post("/conversations/{id}", (exchange: HttpServerExchange) => createConversation(exchange))
       .get("/conversations/{id}", (exchange: HttpServerExchange) => getConversation(exchange))
       .get("/conversations", (exchange: HttpServerExchange) => listConversations(exchange))
+      .put("/conversations/{id}/title", (exchange: HttpServerExchange) => setConversationTitle(exchange))
       .delete("/conversations/{id}", (exchange: HttpServerExchange) => deleteConversation(exchange))
       .post("/conversations/{id}/chat", (exchange: HttpServerExchange) => chat(exchange))
       .get("/models", (exchange: HttpServerExchange) => getModels(exchange))
@@ -38,17 +39,25 @@ class ChatRoutes(private val backend: ChatBackend) {
   // ----------------------------------------------------------------
 
   private def createConversation(exchange: HttpServerExchange): Unit = {
-    val id = conversationId(exchange)
-    if (id == null || id.isBlank) {
-      sendJson(exchange, StatusCodes.BAD_REQUEST, JMap.of("error", "conversation id is required"))
-      return
-    }
-    val created = backend.createConversation(id)
-    if (created) {
-      sendJson(exchange, StatusCodes.CREATED, JMap.of("id", id, "status", "created"))
-    } else {
-      sendJson(exchange, StatusCodes.OK, JMap.of("id", id, "status", "already_exists"))
-    }
+    exchange.getRequestReceiver.receiveFullBytes((ex: HttpServerExchange, bytes: Array[Byte]) => {
+      val id = conversationId(ex)
+      if (id == null || id.isBlank) {
+        sendJson(ex, StatusCodes.BAD_REQUEST, JMap.of("error", "conversation id is required"))
+      } else {
+        val userContext = if (bytes != null && bytes.nonEmpty) {
+          val body = mapper.readValue(bytes, classOf[JMap[_, _]])
+          parseUserContext(body)
+        } else {
+          parseUserContextFromQuery(ex)
+        }
+        val created = backend.createConversation(userContext, id)
+        if (created) {
+          sendJson(ex, StatusCodes.CREATED, JMap.of("id", id, "status", "created"))
+        } else {
+          sendJson(ex, StatusCodes.OK, JMap.of("id", id, "status", "already_exists"))
+        }
+      }
+    })
   }
 
   private def getConversation(exchange: HttpServerExchange): Unit = {
@@ -57,14 +66,38 @@ class ChatRoutes(private val backend: ChatBackend) {
       sendJson(exchange, StatusCodes.BAD_REQUEST, JMap.of("error", "conversation id is required"))
       return
     }
-    val history = backend.getConversationHistory(id)
+    val userContext = parseUserContextFromQuery(exchange)
+    val history = backend.getConversationHistory(userContext, id)
+    val createdAt = backend.listConversations(userContext).find(_.id == id).map(_.createdAt).getOrElse(0L)
     val messages: java.util.List[JMap[String, AnyRef]] = history.map(serializeMessage).asJava
-    sendJson(exchange, StatusCodes.OK, JMap.of("id", id, "messages", messages))
+    sendJson(exchange, StatusCodes.OK, JMap.of("id", id, "createdAt", java.lang.Long.valueOf(createdAt), "messages", messages))
   }
 
   private def listConversations(exchange: HttpServerExchange): Unit = {
-    val ids = backend.listConversations()
-    sendJson(exchange, StatusCodes.OK, JMap.of("conversations", ids.asJava))
+    val userContext = parseUserContextFromQuery(exchange)
+    val conversations = backend.listConversations(userContext).map(serializeConversation).asJava
+    sendJson(exchange, StatusCodes.OK, JMap.of("conversations", conversations))
+  }
+
+  private def setConversationTitle(exchange: HttpServerExchange): Unit = {
+    exchange.getRequestReceiver.receiveFullBytes((ex: HttpServerExchange, bytes: Array[Byte]) => {
+      val id = conversationId(ex)
+      if (id == null || id.isBlank) {
+        sendJson(ex, StatusCodes.BAD_REQUEST, JMap.of("error", "conversation id is required"))
+      } else {
+        val body = if (bytes != null && bytes.nonEmpty) mapper.readValue(bytes, classOf[JMap[_, _]]) else JMap.of[AnyRef, AnyRef]()
+        val title = valueAsString(body.get("title"))
+        if (title == null || title.isBlank) {
+          sendJson(ex, StatusCodes.BAD_REQUEST, JMap.of("error", "title is required"))
+        } else {
+          val userContext =
+            if (bytes != null && bytes.nonEmpty) parseUserContext(body)
+            else parseUserContextFromQuery(ex)
+          backend.setConversationTitle(userContext, id, title)
+          sendJson(ex, StatusCodes.OK, JMap.of("id", id, "title", title, "status", "updated"))
+        }
+      }
+    })
   }
 
   private def deleteConversation(exchange: HttpServerExchange): Unit = {
@@ -73,7 +106,8 @@ class ChatRoutes(private val backend: ChatBackend) {
       sendJson(exchange, StatusCodes.BAD_REQUEST, JMap.of("error", "conversation id is required"))
       return
     }
-    backend.clearConversation(id)
+    val userContext = parseUserContextFromQuery(exchange)
+    backend.clearConversation(userContext, id)
     sendJson(exchange, StatusCodes.OK, JMap.of("id", id, "status", "cleared"))
   }
 
@@ -99,7 +133,7 @@ class ChatRoutes(private val backend: ChatBackend) {
             }
             val requestAttachments = deserializeAttachments(body.get("attachments").asInstanceOf[java.util.List[_]])
             val modelIndex = parseModelIndex(body.get("modelIndex"))
-            val isPremium = parseBoolean(body.get("isPremium"))
+            val userContext = parseUserContext(body)
 
             // SSE headers
             ex.getResponseHeaders.put(Headers.CONTENT_TYPE, "text/event-stream")
@@ -109,7 +143,7 @@ class ChatRoutes(private val backend: ChatBackend) {
             ex.startBlocking()
             val out: OutputStream = ex.getOutputStream
 
-            val result = backend.chat(id, message, requestAttachments, modelIndex, isPremium, new ChatStreamHandler {
+            val result = backend.chat(id, message, requestAttachments, modelIndex, userContext, new ChatStreamHandler {
               override def onToken(token: String): Unit = {
                 try {
                   val sseData = "data: " + mapper.writeValueAsString(JMap.of("token", token)) + "\n\n"
@@ -161,6 +195,33 @@ class ChatRoutes(private val backend: ChatBackend) {
   // Helpers
   // ----------------------------------------------------------------
 
+  private def parseUserContext(body: JMap[_, _]): UserContext = {
+    val isPremium = valueAsString(body.get("isPremium"))
+    val deviceId = valueAsString(body.get("deviceId"))
+    val signedInId = Option(valueAsString(body.get("signedInId"))).filter(_.nonEmpty)
+    UserContext(
+      isPremium = if (isPremium == null || isPremium.isBlank) "false" else isPremium,
+      deviceId = if (deviceId == null || deviceId.isBlank) "unknown" else deviceId,
+      signedInId = signedInId
+    )
+  }
+
+  private def parseUserContextFromQuery(exchange: HttpServerExchange): UserContext = {
+    val isPremium = queryParam(exchange, "isPremium")
+    val deviceId = queryParam(exchange, "deviceId")
+    val signedInId = Option(queryParam(exchange, "signedInId")).filter(_.nonEmpty)
+    UserContext(
+      isPremium = if (isPremium == null || isPremium.isBlank) "false" else isPremium,
+      deviceId = if (deviceId == null || deviceId.isBlank) "unknown" else deviceId,
+      signedInId = signedInId
+    )
+  }
+
+  private def queryParam(exchange: HttpServerExchange, name: String): String = {
+    val qp = exchange.getQueryParameters.get(name)
+    if (qp != null) qp.getFirst else null
+  }
+
   private def parseModelIndex(value: AnyRef): Int = {
     if (value == null) return 0
     value match {
@@ -203,10 +264,18 @@ class ChatRoutes(private val backend: ChatBackend) {
     map.put("type", messageType(msg))
     map.put("text", messageText(msg))
     map.put("archived", java.lang.Boolean.valueOf(msg.archived))
-    map.put("createdAt", msg.createdAt.toString)
+    map.put("createdAt", java.lang.Long.valueOf(msg.createdAt))
     if (msg.attachments != null && msg.attachments.nonEmpty) {
       map.put("attachments", msg.attachments.map(serializeAttachment).asJava)
     }
+    map
+  }
+
+  private def serializeConversation(conversation: Conversation): JMap[String, AnyRef] = {
+    val map = new JLinkedHashMap[String, AnyRef]()
+    map.put("id", conversation.id)
+    map.put("title", conversation.title)
+    map.put("createdAt", java.lang.Long.valueOf(conversation.createdAt))
     map
   }
 

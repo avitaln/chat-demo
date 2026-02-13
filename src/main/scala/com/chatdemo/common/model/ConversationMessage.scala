@@ -1,7 +1,6 @@
 package com.chatdemo.common.model
 
 import dev.langchain4j.data.message.ChatMessage
-import java.time.Instant
 import java.util.UUID
 
 /**
@@ -12,7 +11,7 @@ class ConversationMessage(
   val message: ChatMessage,
   var attachments: List[MessageAttachment],
   var archived: Boolean,
-  val createdAt: Instant
+  val createdAt: Long
 ) {
 
   def this(message: ChatMessage) = {
@@ -21,7 +20,7 @@ class ConversationMessage(
       message,
       Nil,
       false,
-      Instant.now()
+      System.currentTimeMillis()
     )
   }
 
@@ -31,7 +30,7 @@ class ConversationMessage(
       message,
       if (attachments == null) Nil else attachments,
       false,
-      Instant.now()
+      System.currentTimeMillis()
     )
   }
 }

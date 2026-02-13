@@ -1,7 +1,7 @@
 package com.chatdemo.backend.memory
 
 import com.chatdemo.backend.repository.ConversationRepository
-import com.chatdemo.common.model.ConversationMessage
+import com.chatdemo.common.model.{ConversationMessage, UserContext}
 import dev.langchain4j.data.message.{AiMessage, ChatMessage, SystemMessage, UserMessage}
 import dev.langchain4j.store.memory.chat.ChatMemoryStore
 
@@ -17,26 +17,33 @@ import scala.jdk.CollectionConverters.*
  * - Detects newly added messages and persists them
  * - Does NOT handle archiving directly (that's done by SummarizingTokenWindowChatMemory)
  */
-class HistoryAwareChatMemoryStore(private val repository: ConversationRepository) extends ChatMemoryStore {
+class HistoryAwareChatMemoryStore(
+  private val repository: ConversationRepository,
+  private val userContext: UserContext
+) extends ChatMemoryStore {
+
+  private val persistedMessages: ArrayBuffer[ChatMessage] = ArrayBuffer.empty
 
   override def getMessages(memoryId: AnyRef): JList[ChatMessage] = {
     val conversationId = memoryId.toString
     val result = new java.util.ArrayList[ChatMessage]()
+    persistedMessages.clear()
 
     // Add summary as SystemMessage if present
-    val summary = repository.getSummary(conversationId)
+    val summary = repository.getSummary(userContext, conversationId)
     if (summary != null && summary.nonEmpty) {
       result.add(SystemMessage.from("Summary of earlier conversation:\n" + summary))
     }
 
     // Add active (non-archived) messages.
     // Skip persisted system prompts so stale prompt versions do not affect future turns.
-    for (msg <- repository.getActiveMessages(conversationId)) {
+    for (msg <- repository.getActiveMessages(userContext, conversationId)) {
       msg match {
         case _: SystemMessage => // skip persisted system prompts
         case _ =>
           if (!isNoiseMessage(msg)) {
             result.add(msg)
+            persistedMessages.append(msg)
           }
       }
     }
@@ -46,7 +53,7 @@ class HistoryAwareChatMemoryStore(private val repository: ConversationRepository
 
   override def updateMessages(memoryId: AnyRef, messages: JList[ChatMessage]): Unit = {
     val conversationId = memoryId.toString
-    val currentMessages = ArrayBuffer.from(repository.getActiveMessages(conversationId))
+    val currentMessages = persistedMessages
 
     for (message <- messages.asScala) {
       // Skip summary system messages
@@ -58,7 +65,7 @@ class HistoryAwareChatMemoryStore(private val repository: ConversationRepository
           // The current system prompt is injected per-request.
         case _ =>
           if (!isNoiseMessage(message) && !containsMessage(currentMessages, message)) {
-            repository.addMessage(conversationId, message)
+            repository.addMessage(userContext, conversationId, message)
             currentMessages.append(message)
           }
       }
@@ -66,24 +73,24 @@ class HistoryAwareChatMemoryStore(private val repository: ConversationRepository
   }
 
   override def deleteMessages(memoryId: AnyRef): Unit = {
-    repository.clear(memoryId.toString)
+    repository.clear(userContext, memoryId.toString)
   }
 
   /** Archives messages and updates the summary. */
   def archiveMessages(conversationId: String, messageIds: List[String], summary: String): Unit = {
-    repository.archiveMessages(conversationId, messageIds, summary)
+    repository.archiveMessages(userContext, conversationId, messageIds, summary)
   }
 
   /** Get message IDs for active messages. */
   def getActiveMessageIds(conversationId: String): List[String] = {
-    repository.getFullHistory(conversationId)
+    repository.getFullHistory(userContext, conversationId)
       .filter(!_.archived)
       .map(_.id)
   }
 
   /** Get full history for UI display. */
   def getFullHistory(conversationId: String): List[ConversationMessage] = {
-    repository.getFullHistory(conversationId)
+    repository.getFullHistory(userContext, conversationId)
   }
 
   private def containsMessage(messages: scala.collection.Iterable[ChatMessage], target: ChatMessage): Boolean = {

@@ -1,10 +1,9 @@
 package com.chatdemo.backend.repository
 
-import com.chatdemo.common.model.{ConversationMessage, MessageAttachment, MessageAttachmentExtractor}
+import com.chatdemo.common.model.{Conversation, ConversationMessage, MessageAttachment, MessageAttachmentExtractor, UserContext}
 import dev.langchain4j.data.message.{AiMessage, ChatMessage, SystemMessage, UserMessage}
 
 import java.sql.*
-import java.time.Instant
 import scala.collection.mutable.ArrayBuffer
 
 /**
@@ -29,10 +28,25 @@ class SqliteConversationRepository(dbPath: String) extends ConversationRepositor
         stmt.execute(
           """CREATE TABLE IF NOT EXISTS conversations (
             |    id TEXT PRIMARY KEY,
+            |    user_id TEXT,
+            |    title TEXT,
             |    summary TEXT,
             |    summary_updated_at TEXT,
             |    created_at TEXT NOT NULL
             |)""".stripMargin)
+        // Migration: add user_id column if missing (existing DBs)
+        try {
+          stmt.execute("ALTER TABLE conversations ADD COLUMN user_id TEXT")
+        } catch {
+          case _: SQLException => // column already exists
+        }
+        // Migration: add title column if missing (existing DBs)
+        try {
+          stmt.execute("ALTER TABLE conversations ADD COLUMN title TEXT")
+        } catch {
+          case _: SQLException => // column already exists
+        }
+        stmt.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id)")
         stmt.execute(
           """CREATE TABLE IF NOT EXISTS messages (
             |    id TEXT PRIMARY KEY,
@@ -82,14 +96,16 @@ class SqliteConversationRepository(dbPath: String) extends ConversationRepositor
   // Conversation CRUD
   // ----------------------------------------------------------------
 
-  override def createConversation(conversationId: String): Boolean = {
-    val sql = "INSERT OR IGNORE INTO conversations (id, created_at) VALUES (?, ?)"
+  override def createConversation(userContext: UserContext, conversationId: String): Boolean = {
+    val sql = "INSERT OR IGNORE INTO conversations (id, user_id, title, created_at) VALUES (?, ?, ?, ?)"
     val conn = connection()
     try {
       val ps = conn.prepareStatement(sql)
       try {
         ps.setString(1, conversationId)
-        ps.setString(2, Instant.now().toString)
+        ps.setString(2, userContext.effectiveId)
+        ps.setString(3, conversationId)
+        ps.setString(4, System.currentTimeMillis().toString)
         ps.executeUpdate() > 0
       } finally {
         ps.close()
@@ -101,14 +117,22 @@ class SqliteConversationRepository(dbPath: String) extends ConversationRepositor
     }
   }
 
-  override def conversationExists(conversationId: String): Boolean = {
-    val sql = "SELECT 1 FROM conversations WHERE id = ?"
+  override def listConversations(userContext: UserContext): List[Conversation] = {
+    val sql = "SELECT id, title, created_at FROM conversations WHERE user_id = ? ORDER BY created_at"
     val conn = connection()
     try {
       val ps = conn.prepareStatement(sql)
       try {
-        ps.setString(1, conversationId)
-        ps.executeQuery().next()
+        ps.setString(1, userContext.effectiveId)
+        val rs = ps.executeQuery()
+        val conversations = ArrayBuffer.empty[Conversation]
+        while (rs.next()) {
+          val id = rs.getString("id")
+          val title = nonNullTitle(rs.getString("title"), id)
+          val createdAt = parseCreatedAtMillis(rs.getString("created_at"))
+          conversations.append(Conversation(id, title, createdAt))
+        }
+        conversations.toList
       } finally {
         ps.close()
       }
@@ -119,18 +143,16 @@ class SqliteConversationRepository(dbPath: String) extends ConversationRepositor
     }
   }
 
-  override def listConversationIds(): List[String] = {
-    val sql = "SELECT id FROM conversations ORDER BY created_at"
+  override def setConversationTitle(userContext: UserContext, conversationId: String, title: String): Unit = {
+    val sql = "UPDATE conversations SET title = ? WHERE id = ? AND user_id = ?"
     val conn = connection()
     try {
       val ps = conn.prepareStatement(sql)
       try {
-        val rs = ps.executeQuery()
-        val ids = ArrayBuffer.empty[String]
-        while (rs.next()) {
-          ids.append(rs.getString("id"))
-        }
-        ids.toList
+        ps.setString(1, nonNullTitle(title, conversationId))
+        ps.setString(2, conversationId)
+        ps.setString(3, userContext.effectiveId)
+        ps.executeUpdate()
       } finally {
         ps.close()
       }
@@ -145,10 +167,11 @@ class SqliteConversationRepository(dbPath: String) extends ConversationRepositor
   // Messages
   // ----------------------------------------------------------------
 
-  override def getFullHistory(conversationId: String): List[ConversationMessage] = {
+  override def getFullHistory(userContext: UserContext, conversationId: String): List[ConversationMessage] = {
     val sql = "SELECT id, message_type, message_text, archived, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at"
     val conn = connection()
     try {
+      requireOwnedConversation(conn, userContext, conversationId)
       val ps = conn.prepareStatement(sql)
       try {
         ps.setString(1, conversationId)
@@ -158,7 +181,7 @@ class SqliteConversationRepository(dbPath: String) extends ConversationRepositor
           val msgId = rs.getString("id")
           val chatMsg = deserializeMessage(rs.getString("message_type"), rs.getString("message_text"))
           val archived = rs.getInt("archived") == 1
-          val createdAt = Instant.parse(rs.getString("created_at"))
+          val createdAt = parseCreatedAtMillis(rs.getString("created_at"))
           val attachments = loadAttachments(conn, msgId)
           result.append(new ConversationMessage(msgId, chatMsg, attachments, archived, createdAt))
         }
@@ -173,10 +196,11 @@ class SqliteConversationRepository(dbPath: String) extends ConversationRepositor
     }
   }
 
-  override def getActiveMessages(conversationId: String): List[ChatMessage] = {
+  override def getActiveMessages(userContext: UserContext, conversationId: String): List[ChatMessage] = {
     val sql = "SELECT message_type, message_text FROM messages WHERE conversation_id = ? AND archived = 0 ORDER BY created_at"
     val conn = connection()
     try {
+      requireOwnedConversation(conn, userContext, conversationId)
       val ps = conn.prepareStatement(sql)
       try {
         ps.setString(1, conversationId)
@@ -196,10 +220,11 @@ class SqliteConversationRepository(dbPath: String) extends ConversationRepositor
     }
   }
 
-  override def getSummary(conversationId: String): String = {
+  override def getSummary(userContext: UserContext, conversationId: String): String = {
     val sql = "SELECT summary FROM conversations WHERE id = ?"
     val conn = connection()
     try {
+      requireOwnedConversation(conn, userContext, conversationId)
       val ps = conn.prepareStatement(sql)
       try {
         ps.setString(1, conversationId)
@@ -215,8 +240,8 @@ class SqliteConversationRepository(dbPath: String) extends ConversationRepositor
     }
   }
 
-  override def addMessage(conversationId: String, message: ChatMessage): Unit = {
-    createConversation(conversationId)
+  override def addMessage(userContext: UserContext, conversationId: String, message: ChatMessage): Unit = {
+    ensureConversationExists(userContext, conversationId)
     val attachments = MessageAttachmentExtractor.extract(message)
     val cm = new ConversationMessage(message, attachments)
 
@@ -244,20 +269,26 @@ class SqliteConversationRepository(dbPath: String) extends ConversationRepositor
     }
   }
 
-  override def attachToLatestAiMessage(conversationId: String, attachments: List[MessageAttachment]): Unit = {
-    attachToLatestMessage(conversationId, attachments, "ai")
+  override def attachToLatestAiMessage(userContext: UserContext, conversationId: String, attachments: List[MessageAttachment]): Unit = {
+    attachToLatestMessage(userContext, conversationId, attachments, "ai")
   }
 
-  override def attachToLatestUserMessage(conversationId: String, attachments: List[MessageAttachment]): Unit = {
-    attachToLatestMessage(conversationId, attachments, "user")
+  override def attachToLatestUserMessage(userContext: UserContext, conversationId: String, attachments: List[MessageAttachment]): Unit = {
+    attachToLatestMessage(userContext, conversationId, attachments, "user")
   }
 
-  private def attachToLatestMessage(conversationId: String, attachments: List[MessageAttachment], msgType: String): Unit = {
+  private def attachToLatestMessage(
+    userContext: UserContext,
+    conversationId: String,
+    attachments: List[MessageAttachment],
+    msgType: String
+  ): Unit = {
     if (attachments == null || attachments.isEmpty) return
 
     val sql = "SELECT id FROM messages WHERE conversation_id = ? AND message_type = ? ORDER BY created_at DESC LIMIT 1"
     val conn = connection()
     try {
+      requireOwnedConversation(conn, userContext, conversationId)
       val ps = conn.prepareStatement(sql)
       try {
         ps.setString(1, conversationId)
@@ -283,10 +314,11 @@ class SqliteConversationRepository(dbPath: String) extends ConversationRepositor
     }
   }
 
-  override def archiveMessages(conversationId: String, messageIds: List[String], newSummary: String): Unit = {
+  override def archiveMessages(userContext: UserContext, conversationId: String, messageIds: List[String], newSummary: String): Unit = {
     if (messageIds.isEmpty) return
     val conn = connection()
     try {
+      requireOwnedConversation(conn, userContext, conversationId)
       conn.setAutoCommit(false)
       val placeholders = messageIds.map(_ => "?").mkString(",")
       val sql = s"UPDATE messages SET archived = 1 WHERE id IN ($placeholders)"
@@ -302,7 +334,7 @@ class SqliteConversationRepository(dbPath: String) extends ConversationRepositor
       val ps2 = conn.prepareStatement("UPDATE conversations SET summary = ?, summary_updated_at = ? WHERE id = ?")
       try {
         ps2.setString(1, newSummary)
-        ps2.setString(2, Instant.now().toString)
+        ps2.setString(2, System.currentTimeMillis().toString)
         ps2.setString(3, conversationId)
         ps2.executeUpdate()
       } finally {
@@ -316,9 +348,10 @@ class SqliteConversationRepository(dbPath: String) extends ConversationRepositor
     }
   }
 
-  override def clear(conversationId: String): Unit = {
+  override def clear(userContext: UserContext, conversationId: String): Unit = {
     val conn = connection()
     try {
+      requireOwnedConversation(conn, userContext, conversationId)
       conn.setAutoCommit(false)
       val ps1 = conn.prepareStatement(
         "DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = ?)")
@@ -353,6 +386,47 @@ class SqliteConversationRepository(dbPath: String) extends ConversationRepositor
   // ----------------------------------------------------------------
   // Helpers
   // ----------------------------------------------------------------
+
+  /** Ensures a conversation row exists for this user. Used by addMessage for safety. */
+  private def ensureConversationExists(userContext: UserContext, conversationId: String): Unit = {
+    val sql = "INSERT OR IGNORE INTO conversations (id, user_id, title, created_at) VALUES (?, ?, ?, ?)"
+    val conn = connection()
+    try {
+      val ps = conn.prepareStatement(sql)
+      try {
+        ps.setString(1, conversationId)
+        ps.setString(2, userContext.effectiveId)
+        ps.setString(3, conversationId)
+        ps.setString(4, System.currentTimeMillis().toString)
+        ps.executeUpdate()
+      } finally {
+        ps.close()
+      }
+      requireOwnedConversation(conn, userContext, conversationId)
+    } catch {
+      case e: SQLException => throw new RuntimeException(e)
+    } finally {
+      conn.close()
+    }
+  }
+
+  private def requireOwnedConversation(conn: Connection, userContext: UserContext, conversationId: String): Unit = {
+    val sql = "SELECT user_id FROM conversations WHERE id = ?"
+    val ps = conn.prepareStatement(sql)
+    try {
+      ps.setString(1, conversationId)
+      val rs = ps.executeQuery()
+      if (!rs.next()) {
+        throw new IllegalArgumentException("Conversation not found: " + conversationId)
+      }
+      val owner = rs.getString("user_id")
+      if (owner == null || owner != userContext.effectiveId) {
+        throw new SecurityException("Forbidden conversation access")
+      }
+    } finally {
+      ps.close()
+    }
+  }
 
   private def loadAttachments(conn: Connection, messageId: String): List[MessageAttachment] = {
     val sql = "SELECT type, url, mime_type, title FROM attachments WHERE message_id = ?"
@@ -424,5 +498,26 @@ class SqliteConversationRepository(dbPath: String) extends ConversationRepositor
 
   private def nonNullText(value: String): String = {
     if (value == null) "" else value
+  }
+
+  private def nonNullTitle(value: String, fallback: String): String = {
+    if (value == null || value.isBlank) fallback else value
+  }
+
+  private def parseCreatedAtMillis(value: String): Long = {
+    if (value == null || value.isBlank) {
+      0L
+    } else {
+      try {
+        java.lang.Long.parseLong(value)
+      } catch {
+        case _: NumberFormatException =>
+          try {
+            java.time.Instant.parse(value).toEpochMilli
+          } catch {
+            case _: Exception => 0L
+          }
+      }
+    }
   }
 }
