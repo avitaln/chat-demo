@@ -10,10 +10,12 @@ class HardcodedAgentsProvider extends AgentsProvider {
       "For normal knowledge and reasoning questions, answer directly without image tools. " +
       "Return tool outputs directly when they satisfy the request."
 
-  override val getAvailableAgents: List[AgentConfig] = List(
-    AgentConfig(
+  private val agents: Map[String, AgentConfig] = Map(
+    "default" -> AgentConfig(
       id = "default",
       systemPrompt = defaultPrompt
     )
   )
+
+  override def getAgent(id: String): Option[AgentConfig] = agents.get(id)
 }

@@ -47,8 +47,6 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
   // --- Immutable / shared infrastructure (safe across requests) ---
   private val modelsProvider: ModelsProvider = new HardcodedModelsProvider()
   private val agentsProvider: AgentsProvider = new HardcodedAgentsProvider()
-  private val configs: List[ProviderConfig] = modelsProvider.getAvailableModels
-  private val agentsById: Map[String, String] = agentsProvider.getAvailableAgents.map(agent => agent.id -> agent.systemPrompt).toMap
   private val firebaseInitializer: FirebaseInitializer = new FirebaseInitializer(
     FirebaseConfig.getServiceAccountPath,
     FirebaseConfig.getStorageBucket
@@ -154,7 +152,7 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
   // Model management (read-only)
   // ----------------------------------------------------------------
 
-  override def getAvailableModels: List[ProviderConfig] = configs
+  override def getAvailableModels: List[ProviderConfig] = modelsProvider.getAvailableModels
 
   // ----------------------------------------------------------------
   // Chat (stateless per request)
@@ -663,7 +661,7 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
   private def getSystemPromptForRequest(agentId: Option[String]): String = {
     agentId match {
       case Some(id) =>
-        agentsById.get(id).getOrElse {
+        agentsProvider.getAgent(id).map(_.systemPrompt).getOrElse {
           throw new IllegalArgumentException("unknown agentId: " + id)
         }
       case None => defaultSystemPrompt
@@ -989,6 +987,6 @@ class DefaultChatBackend extends ChatBackend with ImageModelAccessPolicy {
 
   private def resolveModelConfig(modelId: String): Option[ProviderConfig] = {
     if (modelId == null || modelId.isBlank) None
-    else configs.find(_.modelId == modelId)
+    else modelsProvider.getAvailableModels.find(_.modelId == modelId)
   }
 }
